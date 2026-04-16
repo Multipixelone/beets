@@ -14,12 +14,13 @@
 
 """An AURA server using Flask."""
 
+from __future__ import annotations
+
 import os
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 from mimetypes import guess_type
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from flask import (
     Blueprint,
@@ -40,11 +41,16 @@ from beets.dbcore.query import (
     NotQuery,
     RegexpQuery,
     SlowFieldSort,
-    SQLiteType,
 )
-from beets.library import Album, Item, LibModel, Library
+from beets.library import Album, Item
 from beets.plugins import BeetsPlugin
 from beets.ui import Subcommand, _open_library
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from beets.dbcore.query import SQLiteType
+    from beets.library import LibModel, Library
 
 # Constants
 
@@ -73,10 +79,11 @@ TRACK_ATTR_MAP = {
     "month": "month",
     "day": "day",
     "bpm": "bpm",
-    "genre": "genre",
+    "genre": "genres",
+    "genres": "genres",
     "recording-mbid": "mb_trackid",  # beets trackid is MB recording
     "track-mbid": "mb_releasetrackid",
-    "composer": "composer",
+    "composer": "composers",
     "albumartist": "albumartist",
     "comments": "comments",
     # Optional for Audio Metadata
@@ -103,7 +110,8 @@ ALBUM_ATTR_MAP = {
     "year": "year",
     "month": "month",
     "day": "day",
-    "genre": "genre",
+    "genre": "genres",
+    "genres": "genres",
     "release-mbid": "mb_albumid",
     "release-group-mbid": "mb_releasegroupid",
 }

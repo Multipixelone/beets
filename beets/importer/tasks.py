@@ -20,18 +20,26 @@ import re
 import shutil
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from enum import Enum
 from tempfile import mkdtemp
-from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Any
 
 import mediafile
 
-from beets import autotag, config, library, plugins, util
+from beets import config, library, plugins, util
+from beets.autotag.hooks import AlbumMatch
+from beets.autotag.match import tag_album, tag_item
 from beets.dbcore.query import PathQuery
+from beets.util import extension
+from beets.util.extension import remux_mpeglayer3_wav
 
 from .state import ImportState
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Sequence
+
+    from beets.autotag.hooks import TrackMatch
     from beets.autotag.match import Recommendation
 
     from .session import ImportSession
@@ -51,15 +59,16 @@ SINGLE_ARTIST_THRESH = 0.25
 # def extend_reimport_fresh_fields_item():
 #     importer.REIMPORT_FRESH_FIELDS_ITEM.extend(['tidal_track_popularity']
 # )
-REIMPORT_FRESH_FIELDS_ALBUM = [
+REIMPORT_FRESH_FIELDS_ITEM = [
     "data_source",
     "bandcamp_album_id",
     "spotify_album_id",
     "deezer_album_id",
     "beatport_album_id",
     "tidal_album_id",
+    "data_url",
 ]
-REIMPORT_FRESH_FIELDS_ITEM = list(REIMPORT_FRESH_FIELDS_ALBUM)
+REIMPORT_FRESH_FIELDS_ALBUM = [*REIMPORT_FRESH_FIELDS_ITEM, "media"]
 
 # Global logger.
 log = logging.getLogger("beets")
@@ -155,12 +164,12 @@ class ImportTask(BaseImportTask):
     """
 
     choice_flag: Action | None = None
-    match: autotag.AlbumMatch | autotag.TrackMatch | None = None
+    match: AlbumMatch | TrackMatch | None = None
 
     # Keep track of the current task item
     cur_album: str | None = None
     cur_artist: str | None = None
-    candidates: Sequence[autotag.AlbumMatch | autotag.TrackMatch] = []
+    candidates: Sequence[AlbumMatch | TrackMatch] | None = None
     rec: Recommendation | None = None
 
     def __init__(
@@ -174,9 +183,7 @@ class ImportTask(BaseImportTask):
         self.should_merge_duplicates = False
         self.is_album = True
 
-    def set_choice(
-        self, choice: Action | autotag.AlbumMatch | autotag.TrackMatch
-    ):
+    def set_choice(self, choice: Action | AlbumMatch | TrackMatch):
         """Given an AlbumMatch or TrackMatch object or an action constant,
         indicates that an action has been selected for this task.
 
@@ -230,7 +237,7 @@ class ImportTask(BaseImportTask):
         or APPLY (in which case the data comes from the choice).
         """
         if self.choice_flag in (Action.ASIS, Action.RETAG):
-            likelies, consensus = util.get_most_common_tags(self.items)
+            likelies, _ = util.get_most_common_tags(self.items)
             return likelies
         elif self.choice_flag is Action.APPLY and self.match:
             return self.match.info.copy()
@@ -243,21 +250,18 @@ class ImportTask(BaseImportTask):
         matched items.
         """
         if self.choice_flag in (Action.ASIS, Action.RETAG):
-            return list(self.items)
+            return self.items
         elif self.choice_flag == Action.APPLY and isinstance(
-            self.match, autotag.AlbumMatch
+            self.match, AlbumMatch
         ):
-            return list(self.match.mapping.keys())
+            return self.match.items
         else:
-            assert False
+            return []
 
-    def apply_metadata(self):
+    def apply_metadata(self) -> None:
         """Copy metadata from match info to the items."""
-        if config["import"]["from_scratch"]:
-            for item in self.match.mapping:
-                item.clear()
-
-        autotag.apply_metadata(self.match.info, self.match.mapping)
+        if self.match:  # TODO: redesign to remove the conditional
+            self.match.apply_metadata()
 
     def duplicate_items(self, lib: library.Library):
         duplicate_items = []
@@ -362,7 +366,7 @@ class ImportTask(BaseImportTask):
         restricted to only those IDs.
         """
         self.cur_artist, self.cur_album, (self.candidates, self.rec) = (
-            autotag.tag_album(self.items, search_ids=search_ids)
+            tag_album(self.items, search_ids=search_ids)
         )
 
     def find_duplicates(self, lib: library.Library) -> list[library.Album]:
@@ -426,14 +430,17 @@ class ImportTask(BaseImportTask):
         elif self.choice_flag in (Action.APPLY, Action.RETAG):
             # Applying autotagged metadata. Just get AA from the first
             # item.
-            if not self.items[0].albumartist:
-                changes["albumartist"] = self.items[0].artist
-            if not self.items[0].albumartists:
-                changes["albumartists"] = self.items[0].artists
-            if not self.items[0].mb_albumartistid:
-                changes["mb_albumartistid"] = self.items[0].mb_artistid
-            if not self.items[0].mb_albumartistids:
-                changes["mb_albumartistids"] = self.items[0].mb_artistids
+            first = self.items[0]
+            if not first.albumartist:
+                changes["albumartist"] = first.artist
+            if not first.albumartists:
+                changes["albumartists"] = first.artists or [first.artist]
+            if not first.mb_albumartistid:
+                changes["mb_albumartistid"] = first.mb_artistid
+            if not first.mb_albumartistids:
+                changes["mb_albumartistids"] = first.mb_artistids or [
+                    first.mb_artistid
+                ]
 
         # Apply new metadata.
         for item in self.items:
@@ -496,13 +503,13 @@ class ImportTask(BaseImportTask):
 
             self.album = lib.add_album(self.imported_items())
             if self.choice_flag == Action.APPLY and isinstance(
-                self.match, autotag.AlbumMatch
+                self.match, AlbumMatch
             ):
                 # Copy album flexible fields to the DB
                 # TODO: change the flow so we create the `Album` object earlier,
                 #   and we can move this into `self.apply_metadata`, just like
                 #   is done for tracks.
-                autotag.apply_album_metadata(self.match.info, self.album)
+                self.match.apply_album_metadata(self.album)
                 self.album.store()
 
             self.reimport_metadata(lib)
@@ -675,17 +682,12 @@ class SingletonImportTask(ImportTask):
     def imported_items(self):
         return [self.item]
 
-    def apply_metadata(self):
-        autotag.apply_item_metadata(self.item, self.match.info)
-
     def _emit_imported(self, lib):
         for item in self.imported_items():
             plugins.send("item_imported", lib=lib, item=item)
 
     def lookup_candidates(self, search_ids: list[str]) -> None:
-        self.candidates, self.rec = autotag.tag_item(
-            self.item, search_ids=search_ids
-        )
+        self.candidates, self.rec = tag_item(self.item, search_ids=search_ids)
 
     def find_duplicates(self, lib: library.Library) -> list[library.Item]:  # type: ignore[override] # Need splitting Singleton and Album tasks into separate classes
         """Return a list of items from `lib` that have the same artist
@@ -888,7 +890,7 @@ class ArchiveImportTask(SentinelImportTask):
                 # The (0, 0, -1) is added to date_time because the
                 # function time.mktime expects a 9-element tuple.
                 # The -1 indicates that the DST flag is unknown.
-                date_time = time.mktime(f.date_time + (0, 0, -1))
+                date_time = time.mktime((*f.date_time, 0, 0, -1))
                 fullpath = os.path.join(extract_to, f.filename)
                 os.utime(fullpath, (date_time, date_time))
 
@@ -1071,11 +1073,26 @@ class ImportTaskFactory:
         If an item cannot be read, return `None` instead and log an
         error.
         """
+
+        # Check if the file has an extension,
+        # Add an extension if there isn't one.
+        if os.path.isfile(path):
+            path = extension.fix_extension(path, logger=log)
+
         try:
             return library.Item.from_path(path)
         except library.ReadError as exc:
             if isinstance(exc.reason, mediafile.FileTypeError):
-                # Silently ignore non-music files.
+                mp3_path = None
+                if config["import"]["remux_mp3_in_wav"].get(bool):
+                    mp3_path = remux_mpeglayer3_wav(path)
+                if mp3_path:
+                    log.info(
+                        "Remuxed MPEGLAYER3 WAV to MP3: {}",
+                        util.displayable_path(mp3_path),
+                    )
+                    return library.Item.from_path(mp3_path)
+                # Silently ignore other non-music files
                 pass
             elif isinstance(exc.reason, mediafile.UnreadableFileError):
                 log.warning("unreadable file: {}", util.displayable_path(path))

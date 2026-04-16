@@ -2,7 +2,7 @@
     :target: https://pypi.python.org/pypi/beets
 
 .. image:: https://img.shields.io/codecov/c/github/beetbox/beets.svg
-    :target: https://codecov.io/github/beetbox/beets
+    :target: https://app.codecov.io/github/beetbox/beets
 
 .. image:: https://img.shields.io/github/actions/workflow/status/beetbox/beets/ci.yaml
     :target: https://github.com/beetbox/beets/actions
@@ -85,7 +85,7 @@ simple if you know a little Python.
 
 .. _transcode audio: https://beets.readthedocs.org/page/plugins/convert.html
 
-.. _writing your own plugin: https://beets.readthedocs.org/page/dev/plugins.html
+.. _writing your own plugin: https://beets.readthedocs.org/page/dev/plugins/index.html
 
 Install
 -------

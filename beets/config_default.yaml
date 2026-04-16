@@ -10,6 +10,8 @@ plugins: [musicbrainz]
 
 pluginpath: []
 
+raise_on_error: no
+
 # --------------- Import ---------------
 
 clutter: ["Thumbs.DB", ".DS_Store"]
@@ -54,6 +56,8 @@ import:
     set_fields: {}
     ignored_alias_types: []
     singleton_album_disambig: yes
+    fix_ext_inplace: no
+    remux_mp3_in_wav: yes
 
 # --------------- Paths ---------------
 
@@ -166,7 +170,7 @@ match:
         missing_tracks: medium
         unmatched_tracks: medium
     distance_weights:
-        source: 2.0
+        data_source: 2.0
         artist: 3.0
         album: 3.0
         media: 1.0

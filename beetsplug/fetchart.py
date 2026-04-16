@@ -23,7 +23,7 @@ from collections import OrderedDict
 from contextlib import closing
 from enum import Enum
 from functools import cached_property
-from typing import TYPE_CHECKING, AnyStr, ClassVar, Literal, Tuple, Type
+from typing import TYPE_CHECKING, Any, AnyStr, ClassVar, Literal
 
 import confuse
 import requests
@@ -32,14 +32,15 @@ from mediafile import image_mime_type
 from beets import config, importer, plugins, ui, util
 from beets.util import bytestring_path, get_temp_filename, sorted_walk, syspath
 from beets.util.artresizer import ArtResizer
-from beets.util.config import sanitize_pairs
+from beets.util.color import colorize
+from beets.util.config import UnknownPairError, sanitize_pairs
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
-    from logging import Logger
 
     from beets.importer import ImportSession, ImportTask
     from beets.library import Album, Library
+    from beets.logging import BeetsLogger as Logger
 
 try:
     from bs4 import BeautifulSoup, Tag
@@ -49,7 +50,11 @@ except ImportError:
     HAS_BEAUTIFUL_SOUP = False
 
 
-CONTENT_TYPES = {"image/jpeg": [b"jpg", b"jpeg"], "image/png": [b"png"]}
+CONTENT_TYPES = {
+    "image/jpeg": [b"jpg", b"jpeg"],
+    "image/png": [b"png"],
+    "image/webp": [b"webp"],
+}
 IMAGE_EXTENSIONS = [ext for exts in CONTENT_TYPES.values() for ext in exts]
 
 
@@ -86,7 +91,7 @@ class Candidate:
         path: None | bytes = None,
         url: None | str = None,
         match: None | MetadataMatch = None,
-        size: None | Tuple[int, int] = None,
+        size: None | tuple[int, int] = None,
     ):
         self._log = log
         self.path = path
@@ -288,7 +293,8 @@ class Candidate:
         elif check == ImageAction.REFORMAT:
             self.path = ArtResizer.shared.reformat(
                 self.path,
-                plugin.cover_format,
+                # TODO: fix this gnarly logic to remove the need for type ignore
+                plugin.cover_format,  # type: ignore[arg-type]
                 deinterlaced=plugin.deinterlace,
             )
 
@@ -328,9 +334,9 @@ def _logged_get(log: Logger, *args, **kwargs) -> requests.Response:
         settings = s.merge_environment_settings(
             prepped.url, {}, None, None, None
         )
-        send_kwargs.update(settings)
         log.debug("{}: {.url}", message, prepped)
-        return s.send(prepped, **send_kwargs)
+        merged_kwargs: dict[Any, Any] = {**send_kwargs, **settings}
+        return s.send(prepped, **merged_kwargs)
 
 
 class RequestMixin:
@@ -355,7 +361,7 @@ class ArtSource(RequestMixin, ABC):
     # Specify whether this source fetches local or remote images
     LOC: ClassVar[SourceLocation]
     # A list of methods to match metadata, sorted by descending accuracy
-    VALID_MATCHING_CRITERIA: list[str] = ["default"]
+    VALID_MATCHING_CRITERIA: ClassVar[list[str]] = ["default"]
     # A human-readable name for the art source
     NAME: ClassVar[str]
     # The key to select the art source in the config. This value will also be
@@ -518,8 +524,8 @@ class RemoteArtSource(ArtSource):
 class CoverArtArchive(RemoteArtSource):
     NAME = "Cover Art Archive"
     ID = "coverart"
-    VALID_MATCHING_CRITERIA = ["release", "releasegroup"]
-    VALID_THUMBNAIL_SIZES = [250, 500, 1200]
+    VALID_MATCHING_CRITERIA: ClassVar[list[str]] = ["release", "releasegroup"]
+    VALID_THUMBNAIL_SIZES: ClassVar[list[int]] = [250, 500, 1200]
 
     URL = "https://coverartarchive.org/release/{mbid}"
     GROUP_URL = "https://coverartarchive.org/release-group/{mbid}"
@@ -682,7 +688,7 @@ class GoogleImages(RemoteArtSource):
         """
         if not (album.albumartist and album.album):
             return
-        search_string = f"{album.albumartist},{album.album}".encode("utf-8")
+        search_string = f"{album.albumartist},{album.album}".encode()
 
         try:
             response = self.request(
@@ -867,7 +873,7 @@ class ITunesStore(RemoteArtSource):
                     )
             except KeyError as e:
                 self._log.debug(
-                    "Malformed itunes candidate: {} not found in {}",  # NOQA E501
+                    "Malformed itunes candidate: {} not found in {}",
                     e,
                     list(c.keys()),
                 )
@@ -1101,6 +1107,16 @@ class FileSystem(LocalArtSource):
                 else:
                     remaining.append(fn)
 
+            # Fall back to a configured image.
+            if plugin.fallback:
+                self._log.debug(
+                    "using fallback art file {}",
+                    util.displayable_path(plugin.fallback),
+                )
+                yield self._candidate(
+                    path=plugin.fallback, match=MetadataMatch.FALLBACK
+                )
+
             # Fall back to any image in the folder.
             if remaining and not plugin.cautious:
                 self._log.debug(
@@ -1118,7 +1134,7 @@ class LastFM(RemoteArtSource):
     ID = "lastfm"
 
     # Sizes in priority order.
-    SIZES = OrderedDict(
+    SIZES: ClassVar[dict[str, tuple[int, int]]] = OrderedDict(
         [
             ("mega", (300, 300)),
             ("extralarge", (300, 300)),
@@ -1293,7 +1309,7 @@ class CoverArtUrl(RemoteArtSource):
 
 
 # All art sources. The order they will be tried in is specified by the config.
-ART_SOURCES: set[Type[ArtSource]] = {
+ART_SOURCES: set[type[ArtSource]] = {
     FileSystem,
     CoverArtArchive,
     ITunesStore,
@@ -1332,6 +1348,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
                 "enforce_ratio": False,
                 "cautious": False,
                 "cover_names": ["cover", "front", "art", "album", "folder"],
+                "fallback": None,
                 "sources": [
                     "filesystem",
                     "coverart",
@@ -1356,7 +1373,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
 
         # allow both pixel and percentage-based margin specifications
         self.enforce_ratio = self.config["enforce_ratio"].get(
-            confuse.OneOf(
+            confuse.OneOf[bool | str](
                 [
                     bool,
                     confuse.String(pattern=self.PAT_PX),
@@ -1380,6 +1397,9 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
         cover_names = self.config["cover_names"].as_str_seq()
         self.cover_names = list(map(util.bytestring_path, cover_names))
         self.cautious = self.config["cautious"].get(bool)
+        self.fallback = self.config["fallback"].get(
+            confuse.Optional(confuse.Filename())
+        )
         self.store_source = self.config["store_source"].get(bool)
 
         self.cover_format = self.config["cover_format"].get(
@@ -1391,16 +1411,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
             self.import_stages = [self.fetch_art]
             self.register_listener("import_task_files", self.assign_art)
 
-        available_sources = [
-            (s_cls.ID, c)
-            for s_cls in ART_SOURCES
-            if s_cls.available(self._log, self.config)
-            for c in s_cls.VALID_MATCHING_CRITERIA
-        ]
-        sources = sanitize_pairs(
-            self.config["sources"].as_pairs(default_value="*"),
-            available_sources,
-        )
+        sources = self._get_sources()
 
         if "remote_priority" in self.config:
             self._log.warning(
@@ -1425,11 +1436,48 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
             for s, c in sources
         ]
 
+    def _get_sources(self) -> list[tuple[str, str]]:
+        available_sources = [
+            (s_cls.ID, c)
+            for s_cls in ART_SOURCES
+            if s_cls.available(self._log, self.config)
+            for c in s_cls.VALID_MATCHING_CRITERIA
+        ]
+
+        if isinstance(self.config["sources"].get(), str):
+            cfg_sources = [(self.config["sources"].get(), "*")]
+        else:
+            cfg_sources = self.config["sources"].as_pairs(default_value="*")
+
+        try:
+            sources = sanitize_pairs(
+                cfg_sources,
+                available_sources,
+                raise_on_unknown=True,
+            )
+
+            if len(sources) == 0:
+                raise ui.UserError("fetchart: no sources defined in config")
+
+            return sources
+        except UnknownPairError as e:
+            raise ui.UserError(e)
+
     @staticmethod
     def _is_source_file_removal_enabled() -> bool:
         return config["import"]["delete"].get(bool) or config["import"][
             "move"
         ].get(bool)
+
+    def _is_candidate_fallback(self, candidate: Candidate) -> bool:
+        try:
+            return (
+                candidate.path is not None
+                and self.fallback is not None
+                and os.path.samefile(candidate.path, self.fallback)
+            )
+        except OSError:
+            return False
 
     # Asynchronous; after music is added to the library.
     def fetch_art(self, session: ImportSession, task: ImportTask) -> None:
@@ -1479,7 +1527,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
 
             self._set_art(task.album, candidate, not removal_enabled)
 
-            if removal_enabled:
+            if removal_enabled and not self._is_candidate_fallback(candidate):
                 task.prune(candidate.path)
 
     # Manual album art fetching.
@@ -1571,10 +1619,8 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
                 and os.path.isfile(syspath(album.artpath))
             ):
                 if not quiet:
-                    message = ui.colorize(
-                        "text_highlight_minor", "has album art"
-                    )
-                    self._log.info("{}: {}", album, message)
+                    message = colorize("text_highlight_minor", "has album art")
+                    ui.print_(f"{album}: {message}")
             else:
                 # In ordinary invocations, look for images on the
                 # filesystem. When forcing, however, always go to the Web
@@ -1584,7 +1630,7 @@ class FetchArtPlugin(plugins.BeetsPlugin, RequestMixin):
                 candidate = self.art_for_album(album, local_paths)
                 if candidate:
                     self._set_art(album, candidate)
-                    message = ui.colorize("text_success", "found album art")
+                    message = colorize("text_success", "found album art")
                 else:
-                    message = ui.colorize("text_error", "no art found")
-                self._log.info("{}: {}", album, message)
+                    message = colorize("text_error", "no art found")
+                ui.print_(f"{album}: {message}")

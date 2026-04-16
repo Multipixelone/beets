@@ -9,132 +9,141 @@ from __future__ import annotations
 
 import abc
 import re
-import warnings
-from typing import TYPE_CHECKING, Generic, Literal, Sequence, TypedDict, TypeVar
+from contextlib import contextmanager
+from functools import cache, cached_property, wraps
+from typing import (
+    TYPE_CHECKING,
+    Generic,
+    Literal,
+    NamedTuple,
+    TypedDict,
+    TypeVar,
+)
 
 import unidecode
-from typing_extensions import NotRequired
+from confuse import NotFoundError
 
+from beets import config, logging
 from beets.util import cached_classproperty
 from beets.util.id_extractors import extract_release_id
 
 from .plugins import BeetsPlugin, find_plugins, notify_info_yielded, send
 
+Ret = TypeVar("Ret")
+QueryType = Literal["album", "track"]
+
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    from confuse import ConfigView
-
-    from .autotag import Distance
     from .autotag.hooks import AlbumInfo, Item, TrackInfo
 
+# Global logger.
+log = logging.getLogger("beets")
 
+
+@cache
 def find_metadata_source_plugins() -> list[MetadataSourcePlugin]:
-    """Returns a list of MetadataSourcePlugin subclass instances
+    """Return a list of all loaded metadata source plugins."""
+    # TODO: Make this an isinstance(MetadataSourcePlugin, ...) check in v3.0.0
+    # This should also allow us to remove the type: ignore comments below.
+    return [p for p in find_plugins() if hasattr(p, "data_source")]  # type: ignore[misc]
 
-    Resolved from all currently loaded beets plugins.
-    """
 
-    all_plugins = find_plugins()
-    metadata_plugins: list[MetadataSourcePlugin | BeetsPlugin] = []
-    for plugin in all_plugins:
-        if isinstance(plugin, MetadataSourcePlugin):
-            metadata_plugins.append(plugin)
-        elif hasattr(plugin, "data_source"):
-            # TODO: Remove this in the future major release, v3.0.0
-            warnings.warn(
-                f"{plugin.__class__.__name__} is used as a legacy metadata source. "
-                "It should extend MetadataSourcePlugin instead of BeetsPlugin. "
-                "Support for this will be removed in the v3.0.0 release!",
-                DeprecationWarning,
-                stacklevel=2,
+@cache
+def get_metadata_source(name: str) -> MetadataSourcePlugin | None:
+    """Get metadata source plugin by name."""
+    name = name.lower()
+    plugins = find_metadata_source_plugins()
+    return next((p for p in plugins if p.data_source.lower() == name), None)
+
+
+@contextmanager
+def maybe_handle_plugin_error(plugin: MetadataSourcePlugin, method_name: str):
+    """Safely call a plugin method, catching and logging exceptions."""
+    if config["raise_on_error"]:
+        yield
+    else:
+        try:
+            yield
+        except Exception as e:
+            log.error(
+                "Error in '{}.{}': {}", plugin.data_source, method_name, e
             )
-            metadata_plugins.append(plugin)
+            log.debug("Exception details:", exc_info=True)
 
-    # typeignore: BeetsPlugin is not a MetadataSourcePlugin (legacy support)
-    return metadata_plugins  # type: ignore[return-value]
+
+def _yield_from_plugins(
+    func: Callable[..., Iterable[Ret]],
+) -> Callable[..., Iterator[Ret]]:
+    method_name = func.__name__
+
+    @wraps(func)
+    def wrapper(*args, **kwargs) -> Iterator[Ret]:
+        for plugin in find_metadata_source_plugins():
+            method = getattr(plugin, method_name)
+            with maybe_handle_plugin_error(plugin, method_name):
+                yield from filter(None, method(*args, **kwargs))
+
+    return wrapper
 
 
 @notify_info_yielded("albuminfo_received")
-def candidates(*args, **kwargs) -> Iterable[AlbumInfo]:
-    """Return matching album candidates from all metadata source plugins."""
-    for plugin in find_metadata_source_plugins():
-        yield from plugin.candidates(*args, **kwargs)
+@_yield_from_plugins
+def candidates(*args, **kwargs) -> Iterator[AlbumInfo]:
+    yield from ()
 
 
 @notify_info_yielded("trackinfo_received")
-def item_candidates(*args, **kwargs) -> Iterable[TrackInfo]:
-    """Return matching track candidates fromm all metadata source plugins."""
-    for plugin in find_metadata_source_plugins():
-        yield from plugin.item_candidates(*args, **kwargs)
+@_yield_from_plugins
+def item_candidates(*args, **kwargs) -> Iterator[TrackInfo]:
+    yield from ()
 
 
-def album_for_id(_id: str) -> AlbumInfo | None:
-    """Get AlbumInfo object for the given ID string.
-
-    A single ID can yield just a single album, so we return the first match.
-    """
-    for plugin in find_metadata_source_plugins():
-        if info := plugin.album_for_id(album_id=_id):
-            send("albuminfo_received", info=info)
-            return info
-
-    return None
+@notify_info_yielded("albuminfo_received")
+@_yield_from_plugins
+def albums_for_ids(*args, **kwargs) -> Iterator[AlbumInfo]:
+    yield from ()
 
 
-def track_for_id(_id: str) -> TrackInfo | None:
-    """Get TrackInfo object for the given ID string.
+@notify_info_yielded("trackinfo_received")
+@_yield_from_plugins
+def tracks_for_ids(*args, **kwargs) -> Iterator[TrackInfo]:
+    yield from ()
 
-    A single ID can yield just a single track, so we return the first match.
-    """
-    for plugin in find_metadata_source_plugins():
-        if info := plugin.track_for_id(_id):
-            send("trackinfo_received", info=info)
-            return info
+
+def album_for_id(_id: str, data_source: str) -> AlbumInfo | None:
+    """Get AlbumInfo object for the given ID and data source."""
+    if plugin := get_metadata_source(data_source):
+        with maybe_handle_plugin_error(plugin, "album_for_id"):
+            if info := plugin.album_for_id(_id):
+                send("albuminfo_received", info=info)
+                return info
 
     return None
 
 
-def track_distance(item: Item, info: TrackInfo) -> Distance:
-    """Returns the track distance for an item and trackinfo.
+def track_for_id(_id: str, data_source: str) -> TrackInfo | None:
+    """Get TrackInfo object for the given ID and data source."""
+    if plugin := get_metadata_source(data_source):
+        with maybe_handle_plugin_error(plugin, "track_for_id"):
+            if info := plugin.track_for_id(_id):
+                send("trackinfo_received", info=info)
+                return info
 
-    Returns a Distance object is populated by all metadata source plugins
-    that implement the :py:meth:`MetadataSourcePlugin.track_distance` method.
-    """
-    from beets.autotag.distance import Distance
-
-    dist = Distance()
-    for plugin in find_metadata_source_plugins():
-        dist.update(plugin.track_distance(item, info))
-    return dist
+    return None
 
 
-def album_distance(
-    items: Sequence[Item],
-    album_info: AlbumInfo,
-    mapping: dict[Item, TrackInfo],
-) -> Distance:
-    """Returns the album distance calculated by plugins."""
-    from beets.autotag.distance import Distance
-
-    dist = Distance()
-    for plugin in find_metadata_source_plugins():
-        dist.update(plugin.album_distance(items, album_info, mapping))
-    return dist
-
-
-def _get_distance(
-    config: ConfigView, data_source: str, info: AlbumInfo | TrackInfo
-) -> Distance:
-    """Returns the ``data_source`` weight and the maximum source weight
-    for albums or individual tracks.
-    """
-    from beets.autotag.distance import Distance
-
-    dist = Distance()
-    if info.data_source == data_source:
-        dist.add("source", config["source_weight"].as_number())
-    return dist
+@cache
+def get_penalty(data_source: str | None) -> float:
+    """Get the penalty value for the given data source."""
+    return next(
+        (
+            p.data_source_mismatch_penalty
+            for p in find_metadata_source_plugins()
+            if p.data_source == data_source
+        ),
+        MetadataSourcePlugin.DEFAULT_DATA_SOURCE_MISMATCH_PENALTY,
+    )
 
 
 class MetadataSourcePlugin(BeetsPlugin, metaclass=abc.ABCMeta):
@@ -145,12 +154,29 @@ class MetadataSourcePlugin(BeetsPlugin, metaclass=abc.ABCMeta):
     and tracks, and to retrieve album and track information by ID.
     """
 
+    DEFAULT_DATA_SOURCE_MISMATCH_PENALTY = 0.5
+
+    @cached_classproperty
+    def data_source(cls) -> str:
+        """The data source name for this plugin.
+
+        This is inferred from the plugin name.
+        """
+        return cls.__name__.replace("Plugin", "")  # type: ignore[attr-defined]
+
+    @cached_property
+    def data_source_mismatch_penalty(self) -> float:
+        try:
+            return self.config["source_weight"].as_number()
+        except NotFoundError:
+            return self.config["data_source_mismatch_penalty"].as_number()
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.config.add(
             {
                 "search_limit": 5,
-                "source_weight": 0.5,
+                "data_source_mismatch_penalty": self.DEFAULT_DATA_SOURCE_MISMATCH_PENALTY,  # noqa: E501
             }
         )
 
@@ -202,7 +228,7 @@ class MetadataSourcePlugin(BeetsPlugin, metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
-    def albums_for_ids(self, ids: Sequence[str]) -> Iterable[AlbumInfo | None]:
+    def albums_for_ids(self, ids: Iterable[str]) -> Iterable[AlbumInfo | None]:
         """Batch lookup of album metadata for a list of album IDs.
 
         Given a list of album identifiers, yields corresponding AlbumInfo objects.
@@ -213,7 +239,7 @@ class MetadataSourcePlugin(BeetsPlugin, metaclass=abc.ABCMeta):
 
         return (self.album_for_id(id) for id in ids)
 
-    def tracks_for_ids(self, ids: Sequence[str]) -> Iterable[TrackInfo | None]:
+    def tracks_for_ids(self, ids: Iterable[str]) -> Iterable[TrackInfo | None]:
         """Batch lookup of track metadata for a list of track IDs.
 
         Given a list of track identifiers, yields corresponding TrackInfo objects.
@@ -223,35 +249,6 @@ class MetadataSourcePlugin(BeetsPlugin, metaclass=abc.ABCMeta):
         """
 
         return (self.track_for_id(id) for id in ids)
-
-    def album_distance(
-        self,
-        items: Sequence[Item],
-        album_info: AlbumInfo,
-        mapping: dict[Item, TrackInfo],
-    ) -> Distance:
-        """Calculate the distance for an album based on its items and album info."""
-        return _get_distance(
-            data_source=self.data_source, info=album_info, config=self.config
-        )
-
-    def track_distance(
-        self,
-        item: Item,
-        info: TrackInfo,
-    ) -> Distance:
-        """Calculate the distance for a track based on its item and track info."""
-        return _get_distance(
-            data_source=self.data_source, info=info, config=self.config
-        )
-
-    @cached_classproperty
-    def data_source(cls) -> str:
-        """The data source name for this plugin.
-
-        This is inferred from the plugin name.
-        """
-        return cls.__name__.replace("Plugin", "")  # type: ignore[attr-defined]
 
     def _extract_id(self, url: str) -> str | None:
         """Extract an ID from a URL for this metadata source plugin.
@@ -271,10 +268,9 @@ class MetadataSourcePlugin(BeetsPlugin, metaclass=abc.ABCMeta):
         """Returns an artist string (all artists) and an artist_id (the main
         artist) for a list of artist object dicts.
 
-        For each artist, this function moves articles (such as 'a', 'an',
-        and 'the') to the front and strips trailing disambiguation numbers. It
-        returns a tuple containing the comma-separated string of all
-        normalized artists and the ``id`` of the main/first artist.
+        For each artist, this function moves articles (such as 'a', 'an', and 'the')
+        to the front. It returns a tuple containing the comma-separated string
+        of all normalized artists and the ``id`` of the main/first artist.
         Alternatively a keyword can be used to combine artists together into a
         single string by passing the join_key argument.
 
@@ -298,8 +294,6 @@ class MetadataSourcePlugin(BeetsPlugin, metaclass=abc.ABCMeta):
             if not artist_id:
                 artist_id = artist[id_key]
             name = artist[name_key]
-            # Strip disambiguation number.
-            name = re.sub(r" \(\d+\)$", "", name)
             # Move articles to the front.
             name = re.sub(r"^(.*?), (a|an|the)$", r"\2 \1", name, flags=re.I)
             # Use a join keyword if requested and available.
@@ -319,9 +313,17 @@ class IDResponse(TypedDict):
     id: str
 
 
-class SearchFilter(TypedDict):
-    artist: NotRequired[str]
-    album: NotRequired[str]
+class SearchParams(NamedTuple):
+    """Bundle normalized search context passed to provider search hooks.
+
+    Shared search orchestration constructs this value so plugin hooks receive
+    one object describing search intent, query text, and provider filters.
+    """
+
+    query_type: QueryType
+    query: str
+    filters: dict[str, str]
+    limit: int
 
 
 R = TypeVar("R", bound=IDResponse)
@@ -348,21 +350,79 @@ class SearchApiMetadataSourcePlugin(
         )
 
     @abc.abstractmethod
-    def _search_api(
+    def get_search_query_with_filters(
         self,
-        query_type: Literal["album", "track"],
-        filters: SearchFilter,
-        query_string: str = "",
-    ) -> Sequence[R]:
-        """Perform a search on the API.
+        query_type: QueryType,
+        items: Sequence[Item],
+        artist: str,
+        name: str,
+        va_likely: bool,
+    ) -> tuple[str, dict[str, str]]:
+        """Build query text and API filters for a provider search.
 
-        :param query_type: The type of query to perform.
-        :param filters: A dictionary of filters to apply to the search.
-        :param query_string: Additional query to include in the search.
+        Subclasses can override this hook when their API requires a query format
+        or filter set that differs from the default text-based construction.
 
-        Should return a list of identifiers for the requested type (album or track).
+        :param query_type: The type of query to perform. Either *album* or *track*
+        :param items: List of items the search is being performed for
+        :param artist: Artist name
+        :param name: Album or track name, depending on ``query_type``
+        :param va_likely: Whether the search is likely to be for various artists
+        :return: Tuple of (``query`` text, ``filters`` dict) to use for the
+            search API call
         """
+
+    @abc.abstractmethod
+    def get_search_response(self, params: SearchParams) -> Sequence[R]:
+        """Fetch raw search results for a provider request.
+
+        Implementations should return records containing source IDs so shared
+        candidate resolution can perform ID-based album and track lookups.
+
+        :param params: :py:namedtuple:`~SearchParams` named tuple
+        :return: Sequence of IDResponse dicts containing at least an "id" key for each
+        """
+
         raise NotImplementedError
+
+    def _search_api(
+        self, query_type: QueryType, query: str, filters: dict[str, str]
+    ) -> Sequence[R]:
+        """Run shared provider search orchestration and return ID-bearing results.
+
+        This path applies optional query normalization and default limits, then
+        delegates API access to provider hooks with consistent logging and
+        failure handling.
+        """
+        if self.config["search_query_ascii"].get():
+            query = unidecode.unidecode(query)
+
+        limit = self.config["search_limit"].get(int)
+        params = SearchParams(query_type, query, filters, limit)
+
+        self._log.debug("Searching for '{}' with {}", query, filters)
+        try:
+            response_data = self.get_search_response(params)
+        except Exception as e:
+            if config["raise_on_error"].get(bool):
+                raise
+            self._log.error(
+                "Error searching {.data_source}: {}", self, e, exc_info=True
+            )
+            return ()
+
+        self._log.debug("Found {} result(s)", len(response_data))
+        return response_data
+
+    def _get_candidates(
+        self, query_type: QueryType, *args, **kwargs
+    ) -> Sequence[R]:
+        """Resolve query hooks and execute one provider search request."""
+
+        return self._search_api(
+            query_type,
+            *self.get_search_query_with_filters(query_type, *args, **kwargs),
+        )
 
     def candidates(
         self,
@@ -371,54 +431,11 @@ class SearchApiMetadataSourcePlugin(
         album: str,
         va_likely: bool,
     ) -> Iterable[AlbumInfo]:
-        query_filters: SearchFilter = {}
-        if album:
-            query_filters["album"] = album
-        if not va_likely:
-            query_filters["artist"] = artist
-
-        results = self._search_api("album", query_filters)
-        if not results:
-            return []
-
-        return filter(
-            None, self.albums_for_ids([result["id"] for result in results])
-        )
+        results = self._get_candidates("album", items, artist, album, va_likely)
+        return filter(None, self.albums_for_ids(r["id"] for r in results))
 
     def item_candidates(
         self, item: Item, artist: str, title: str
     ) -> Iterable[TrackInfo]:
-        results = self._search_api(
-            "track", {"artist": artist}, query_string=title
-        )
-        if not results:
-            return []
-
-        return filter(
-            None,
-            self.tracks_for_ids([result["id"] for result in results if result]),
-        )
-
-    def _construct_search_query(
-        self, filters: SearchFilter, query_string: str
-    ) -> str:
-        """Construct a query string with the specified filters and keywords to
-        be provided to the spotify (or similar) search API.
-
-        The returned format was initially designed for spotify's search API but
-        we found is also useful with other APIs that support similar query structures.
-        see `spotify <https://developer.spotify.com/documentation/web-api/reference/search>`_
-        and `deezer <https://developers.deezer.com/api/search>`_.
-
-        :param filters: Field filters to apply.
-        :param query_string: Query keywords to use.
-        :return: Query string to be provided to the search API.
-        """
-
-        components = [query_string, *(f'{k}:"{v}"' for k, v in filters.items())]
-        query = " ".join(filter(None, components))
-
-        if self.config["search_query_ascii"].get():
-            query = unidecode.unidecode(query)
-
-        return query
+        results = self._get_candidates("track", [item], artist, title, False)
+        return filter(None, self.tracks_for_ids(r["id"] for r in results))

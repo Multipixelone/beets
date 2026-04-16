@@ -19,6 +19,7 @@ import logging
 import os
 import pkgutil
 import sys
+from typing import ClassVar
 from unittest.mock import ANY, Mock, patch
 
 import pytest
@@ -37,16 +38,17 @@ from beets.test import helper
 from beets.test.helper import (
     AutotagStub,
     ImportHelper,
+    IOMixin,
     PluginMixin,
     PluginTestCase,
     TerminalImportMixin,
 )
-from beets.util import displayable_path, syspath
+from beets.util import PromptChoice, displayable_path, syspath
 
 
-class TestPluginRegistration(PluginTestCase):
+class TestPluginRegistration(IOMixin, PluginTestCase):
     class RatingPlugin(plugins.BeetsPlugin):
-        item_types = {
+        item_types: ClassVar[dict[str, types.Type]] = {
             "rating": types.Float(),
             "multi_value": types.MULTI_VALUE_DSV,
         }
@@ -70,7 +72,9 @@ class TestPluginRegistration(PluginTestCase):
 
     def test_duplicate_type(self):
         class DuplicateTypePlugin(plugins.BeetsPlugin):
-            item_types = {"rating": types.INTEGER}
+            item_types: ClassVar[dict[str, types.Type]] = {
+                "rating": types.INTEGER
+            }
 
         self.register_plugin(DuplicateTypePlugin)
         with pytest.raises(
@@ -92,8 +96,7 @@ class TestPluginRegistration(PluginTestCase):
         item.add(self.lib)
 
         out = self.run_with_output("ls", "-f", "$multi_value")
-        delimiter = types.MULTI_VALUE_DSV.delimiter
-        assert out == f"one{delimiter}two{delimiter}three\n"
+        assert out == "one; two; three\n"
 
 
 class PluginImportTestCase(ImportHelper, PluginTestCase):
@@ -292,8 +295,8 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
 
             def return_choices(self, session, task):
                 return [
-                    ui.commands.PromptChoice("f", "Foo", None),
-                    ui.commands.PromptChoice("r", "baR", None),
+                    PromptChoice("f", "Foo", None),
+                    PromptChoice("r", "baR", None),
                 ]
 
         self.register_plugin(DummyPlugin)
@@ -308,7 +311,9 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
             "Enter search",
             "enter Id",
             "aBort",
-        ) + ("Foo", "baR")
+            "Foo",
+            "baR",
+        )
 
         self.importer.add_choice(Action.SKIP)
         self.importer.run()
@@ -328,8 +333,8 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
 
             def return_choices(self, session, task):
                 return [
-                    ui.commands.PromptChoice("f", "Foo", None),
-                    ui.commands.PromptChoice("r", "baR", None),
+                    PromptChoice("f", "Foo", None),
+                    PromptChoice("r", "baR", None),
                 ]
 
         self.register_plugin(DummyPlugin)
@@ -342,7 +347,9 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
             "Enter search",
             "enter Id",
             "aBort",
-        ) + ("Foo", "baR")
+            "Foo",
+            "baR",
+        )
 
         config["import"]["singletons"] = True
         self.importer.add_choice(Action.SKIP)
@@ -363,10 +370,10 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
 
             def return_choices(self, session, task):
                 return [
-                    ui.commands.PromptChoice("a", "A foo", None),  # dupe
-                    ui.commands.PromptChoice("z", "baZ", None),  # ok
-                    ui.commands.PromptChoice("z", "Zupe", None),  # dupe
-                    ui.commands.PromptChoice("z", "Zoo", None),
+                    PromptChoice("a", "A foo", None),  # dupe
+                    PromptChoice("z", "baZ", None),  # ok
+                    PromptChoice("z", "Zupe", None),  # dupe
+                    PromptChoice("z", "Zoo", None),
                 ]  # dupe
 
         self.register_plugin(DummyPlugin)
@@ -381,7 +388,8 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
             "Enter search",
             "enter Id",
             "aBort",
-        ) + ("baZ",)
+            "baZ",
+        )
         self.importer.add_choice(Action.SKIP)
         self.importer.run()
         self.mock_input_options.assert_called_once_with(
@@ -399,7 +407,7 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
                 )
 
             def return_choices(self, session, task):
-                return [ui.commands.PromptChoice("f", "Foo", self.foo)]
+                return [PromptChoice("f", "Foo", self.foo)]
 
             def foo(self, session, task):
                 pass
@@ -416,12 +424,14 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
             "Enter search",
             "enter Id",
             "aBort",
-        ) + ("Foo",)
+            "Foo",
+        )
 
         # DummyPlugin.foo() should be called once
         with patch.object(DummyPlugin, "foo", autospec=True) as mock_foo:
-            with helper.control_stdin("\n".join(["f", "s"])):
-                self.importer.run()
+            self.io.addinput("f")
+            self.io.addinput("n")
+            self.importer.run()
             assert mock_foo.call_count == 1
 
         # input_options should be called twice, as foo() returns None
@@ -441,7 +451,7 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
                 )
 
             def return_choices(self, session, task):
-                return [ui.commands.PromptChoice("f", "Foo", self.foo)]
+                return [PromptChoice("f", "Foo", self.foo)]
 
             def foo(self, session, task):
                 return Action.SKIP
@@ -458,11 +468,12 @@ class PromptChoicesTest(TerminalImportMixin, PluginImportTestCase):
             "Enter search",
             "enter Id",
             "aBort",
-        ) + ("Foo",)
+            "Foo",
+        )
 
         # DummyPlugin.foo() should be called once
-        with helper.control_stdin("f\n"):
-            self.importer.run()
+        self.io.addinput("f")
+        self.importer.run()
 
         # input_options should be called once, as foo() returns SKIP
         self.mock_input_options.assert_called_once_with(
@@ -522,4 +533,60 @@ class TestImportPlugin(PluginMixin):
 
         assert "PluginImportError" not in caplog.text, (
             f"Plugin '{plugin_name}' has issues during import."
+        )
+
+
+class TestDeprecationCopy:
+    # TODO: remove this test in Beets 3.0.0
+    def test_legacy_metadata_plugin_deprecation(self):
+        """Test that a MetadataSourcePlugin with 'legacy' data_source
+        raises a deprecation warning and all function and properties are
+        copied from the base class.
+        """
+        with pytest.warns(DeprecationWarning, match="LegacyMetadataPlugin"):
+
+            class LegacyMetadataPlugin(plugins.BeetsPlugin):
+                data_source = "legacy"
+
+        # Assert all methods are present
+        assert hasattr(LegacyMetadataPlugin, "albums_for_ids")
+        assert hasattr(LegacyMetadataPlugin, "tracks_for_ids")
+        assert hasattr(LegacyMetadataPlugin, "data_source_mismatch_penalty")
+        assert hasattr(LegacyMetadataPlugin, "_extract_id")
+        assert hasattr(LegacyMetadataPlugin, "get_artist")
+
+
+class TestMusicBrainzPluginLoading:
+    @pytest.fixture(autouse=True)
+    def config(self):
+        _config = config
+        _config.sources = []
+        _config.read(user=False, defaults=True)
+        return _config
+
+    def test_default(self):
+        assert "musicbrainz" in plugins.get_plugin_names()
+
+    def test_other_plugin_enabled(self, config):
+        config["plugins"] = ["anything"]
+
+        assert "musicbrainz" not in plugins.get_plugin_names()
+
+    def test_deprecated_enabled(self, config, caplog):
+        config["plugins"] = ["anything"]
+        config["musicbrainz"]["enabled"] = True
+
+        assert "musicbrainz" in plugins.get_plugin_names()
+        assert (
+            "musicbrainz.enabled' configuration option is deprecated"
+            in caplog.text
+        )
+
+    def test_deprecated_disabled(self, config, caplog):
+        config["musicbrainz"]["enabled"] = False
+
+        assert "musicbrainz" not in plugins.get_plugin_names()
+        assert (
+            "musicbrainz.enabled' configuration option is deprecated"
+            in caplog.text
         )

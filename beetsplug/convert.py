@@ -95,12 +95,18 @@ def in_no_convert(item: Item) -> bool:
         return False
 
 
-def should_transcode(item, fmt):
+def should_transcode(item, fmt, force: bool = False):
     """Determine whether the item should be transcoded as part of
     conversion (i.e., its bitrate is high or it has the wrong format).
+
+    If ``force`` is True, safety checks like ``no_convert`` and
+    ``never_convert_lossy_files`` are ignored and the item is always
+    transcoded.
     """
+    if force:
+        return True
     if in_no_convert(item) or (
-        config["convert"]["never_convert_lossy_files"]
+        config["convert"]["never_convert_lossy_files"].get(bool)
         and item.format.lower() not in LOSSLESS_FORMATS
     ):
         return False
@@ -122,6 +128,7 @@ class ConvertPlugin(BeetsPlugin):
                 "threads": os.cpu_count(),
                 "format": "mp3",
                 "id3v23": "inherit",
+                "write_metadata": True,
                 "formats": {
                     "aac": {
                         "command": (
@@ -235,6 +242,16 @@ class ConvertPlugin(BeetsPlugin):
                               drive, relative paths pointing to media files
                               will be used.""",
         )
+        cmd.parser.add_option(
+            "-F",
+            "--force",
+            action="store_true",
+            dest="force",
+            help=(
+                "force transcoding. Ignores no_convert, "
+                "never_convert_lossy_files, and max_bitrate"
+            ),
+        )
         cmd.parser.add_album_option()
         cmd.func = self.convert_func
         return [cmd]
@@ -257,10 +274,15 @@ class ConvertPlugin(BeetsPlugin):
                 pretend,
                 hardlink,
                 link,
-                playlist,
+                _,
+                force,
             ) = self._get_opts_and_config(empty_opts)
 
             items = task.imported_items()
+
+            # Filter items based on should_transcode function
+            items = [item for item in items if should_transcode(item, fmt)]
+
             self._parallel_convert(
                 dest,
                 False,
@@ -271,6 +293,7 @@ class ConvertPlugin(BeetsPlugin):
                 hardlink,
                 threads,
                 items,
+                force,
             )
 
     # Utilities converted from functions to methods on logging overhaul
@@ -346,6 +369,7 @@ class ConvertPlugin(BeetsPlugin):
         pretend=False,
         link=False,
         hardlink=False,
+        force=False,
     ):
         """A pipeline thread that converts `Item` objects from a
         library.
@@ -371,11 +395,11 @@ class ConvertPlugin(BeetsPlugin):
             if keep_new:
                 original = dest
                 converted = item.path
-                if should_transcode(item, fmt):
+                if should_transcode(item, fmt, force):
                     converted = replace_ext(converted, ext)
             else:
                 original = item.path
-                if should_transcode(item, fmt):
+                if should_transcode(item, fmt, force):
                     dest = replace_ext(dest, ext)
                 converted = dest
 
@@ -405,7 +429,7 @@ class ConvertPlugin(BeetsPlugin):
                     )
                     util.move(item.path, original)
 
-            if should_transcode(item, fmt):
+            if should_transcode(item, fmt, force):
                 linked = False
                 try:
                     self.encode(command, original, converted, pretend)
@@ -446,8 +470,9 @@ class ConvertPlugin(BeetsPlugin):
             if id3v23 == "inherit":
                 id3v23 = None
 
-            # Write tags from the database to the converted file.
-            item.try_write(path=converted, id3v23=id3v23)
+            # Write tags from the database to the file if requested
+            if self.config["write_metadata"].get(bool):
+                item.try_write(path=converted, id3v23=id3v23)
 
             if keep_new:
                 # If we're keeping the transcoded file, read it again (after
@@ -575,6 +600,7 @@ class ConvertPlugin(BeetsPlugin):
             hardlink,
             link,
             playlist,
+            force,
         ) = self._get_opts_and_config(opts)
 
         if opts.album:
@@ -601,6 +627,28 @@ class ConvertPlugin(BeetsPlugin):
                     album, dest, path_formats, pretend, link, hardlink
                 )
 
+        # If the user supplied a playlist name, create a playlist for files
+        # copied to the destination.
+        pl_normpath = None
+        items_paths = None
+        if playlist:
+            _, ext = get_format(fmt)
+            # Playlist paths are understood as relative to the dest directory.
+            pl_normpath = util.normpath(playlist)
+            pl_dir = os.path.dirname(pl_normpath)
+            items_paths = []
+            for item in items:
+                item_path = item.destination(
+                    basedir=dest, path_formats=path_formats
+                )
+
+                # When keeping new files in the library, destination paths
+                # keep original files and extensions.
+                if not opts.keep_new and should_transcode(item, fmt, force):
+                    item_path = replace_ext(item_path, ext)
+
+                items_paths.append(os.path.relpath(item_path, pl_dir))
+
         self._parallel_convert(
             dest,
             opts.keep_new,
@@ -611,23 +659,11 @@ class ConvertPlugin(BeetsPlugin):
             hardlink,
             threads,
             items,
+            force,
         )
 
         if playlist:
-            # Playlist paths are understood as relative to the dest directory.
-            pl_normpath = util.normpath(playlist)
-            pl_dir = os.path.dirname(pl_normpath)
             self._log.info("Creating playlist file {}", pl_normpath)
-            # Generates a list of paths to media files, ensures the paths are
-            # relative to the playlist's location and translates the unicode
-            # strings we get from item.destination to bytes.
-            items_paths = [
-                os.path.relpath(
-                    item.destination(basedir=dest, path_formats=path_formats),
-                    pl_dir,
-                )
-                for item in items
-            ]
             if not pretend:
                 m3ufile = M3UFile(playlist)
                 m3ufile.set_contents(items_paths)
@@ -733,7 +769,7 @@ class ConvertPlugin(BeetsPlugin):
         else:
             hardlink = self.config["hardlink"].get(bool)
             link = self.config["link"].get(bool)
-
+        force = getattr(opts, "force", False)
         return (
             dest,
             threads,
@@ -743,6 +779,7 @@ class ConvertPlugin(BeetsPlugin):
             hardlink,
             link,
             playlist,
+            force,
         )
 
     def _parallel_convert(
@@ -756,13 +793,21 @@ class ConvertPlugin(BeetsPlugin):
         hardlink,
         threads,
         items,
+        force,
     ):
         """Run the convert_item function for every items on as many thread as
         defined in threads
         """
         convert = [
             self.convert_item(
-                dest, keep_new, path_formats, fmt, pretend, link, hardlink
+                dest,
+                keep_new,
+                path_formats,
+                fmt,
+                pretend,
+                link,
+                hardlink,
+                force,
             )
             for _ in range(threads)
         ]

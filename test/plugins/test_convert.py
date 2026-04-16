@@ -11,14 +11,14 @@
 #
 # The above copyright notice and this permission notice shall be
 # included in all copies or substantial portions of the Software.
-
+from __future__ import annotations
 
 import fnmatch
 import os.path
 import re
 import sys
 import unittest
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from mediafile import MediaFile
@@ -29,11 +29,14 @@ from beets.test import _common
 from beets.test.helper import (
     AsIsImporterMixin,
     ImportHelper,
+    IOMixin,
     PluginTestCase,
     capture_log,
-    control_stdin,
 )
 from beetsplug import convert
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def shell_quote(text):
@@ -63,7 +66,7 @@ class ConvertMixin:
         return path.read_bytes().endswith(tag.encode("utf-8"))
 
 
-class ConvertTestCase(ConvertMixin, PluginTestCase):
+class ConvertTestCase(IOMixin, ConvertMixin, PluginTestCase):
     db_on_disk = True
     plugin = "convert"
 
@@ -154,8 +157,8 @@ class ConvertCliTest(ConvertTestCase, ConvertCommand):
         }
 
     def test_convert(self):
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         assert self.file_endswith(self.converted_mp3, "mp3")
 
     def test_convert_with_auto_confirmation(self):
@@ -163,22 +166,22 @@ class ConvertCliTest(ConvertTestCase, ConvertCommand):
         assert self.file_endswith(self.converted_mp3, "mp3")
 
     def test_reject_confirmation(self):
-        with control_stdin("n"):
-            self.run_convert()
+        self.io.addinput("n")
+        self.run_convert()
         assert not self.converted_mp3.exists()
 
     def test_convert_keep_new(self):
         assert os.path.splitext(self.item.path)[1] == b".ogg"
 
-        with control_stdin("y"):
-            self.run_convert("--keep-new")
+        self.io.addinput("y")
+        self.run_convert("--keep-new")
 
         self.item.load()
         assert os.path.splitext(self.item.path)[1] == b".mp3"
 
     def test_format_option(self):
-        with control_stdin("y"):
-            self.run_convert("--format", "opus")
+        self.io.addinput("y")
+        self.run_convert("--format", "opus")
         assert self.file_endswith(self.convert_dest / "converted.ops", "opus")
 
     def test_embed_album_art(self):
@@ -189,8 +192,8 @@ class ConvertCliTest(ConvertTestCase, ConvertCommand):
         with open(os.path.join(image_path), "rb") as f:
             image_data = f.read()
 
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         mediafile = MediaFile(self.converted_mp3)
         assert mediafile.images[0].data == image_data
 
@@ -212,53 +215,98 @@ class ConvertCliTest(ConvertTestCase, ConvertCommand):
 
     def test_no_transcode_when_maxbr_set_high_and_different_formats(self):
         self.config["convert"]["max_bitrate"] = 5000
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         assert self.file_endswith(self.converted_mp3, "mp3")
 
     def test_transcode_when_maxbr_set_low_and_different_formats(self):
         self.config["convert"]["max_bitrate"] = 5
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         assert self.file_endswith(self.converted_mp3, "mp3")
 
     def test_transcode_when_maxbr_set_to_none_and_different_formats(self):
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         assert self.file_endswith(self.converted_mp3, "mp3")
 
     def test_no_transcode_when_maxbr_set_high_and_same_formats(self):
         self.config["convert"]["max_bitrate"] = 5000
         self.config["convert"]["format"] = "ogg"
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         assert not self.file_endswith(
             self.convert_dest / "converted.ogg", "ogg"
         )
 
+    def test_force_overrides_max_bitrate_and_same_formats(self):
+        self.config["convert"]["max_bitrate"] = 5000
+        self.config["convert"]["format"] = "ogg"
+
+        self.io.addinput("y")
+        self.run_convert("--force")
+
+        converted = self.convert_dest / "converted.ogg"
+        assert self.file_endswith(converted, "ogg")
+
     def test_transcode_when_maxbr_set_low_and_same_formats(self):
         self.config["convert"]["max_bitrate"] = 5
         self.config["convert"]["format"] = "ogg"
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         assert self.file_endswith(self.convert_dest / "converted.ogg", "ogg")
 
     def test_transcode_when_maxbr_set_to_none_and_same_formats(self):
         self.config["convert"]["format"] = "ogg"
-        with control_stdin("y"):
-            self.run_convert()
+        self.io.addinput("y")
+        self.run_convert()
         assert not self.file_endswith(
             self.convert_dest / "converted.ogg", "ogg"
         )
 
     def test_playlist(self):
-        with control_stdin("y"):
-            self.run_convert("--playlist", "playlist.m3u8")
+        self.io.addinput("y")
+        self.run_convert("--playlist", "playlist.m3u8")
         assert (self.convert_dest / "playlist.m3u8").exists()
 
     def test_playlist_pretend(self):
         self.run_convert("--playlist", "playlist.m3u8", "--pretend")
         assert not (self.convert_dest / "playlist.m3u8").exists()
+
+    def test_force_overrides_no_convert(self):
+        self.config["convert"]["formats"]["opus"] = {
+            "command": self.tagged_copy_cmd("opus"),
+            "extension": "ops",
+        }
+        self.config["convert"]["no_convert"] = "format:ogg"
+
+        [item] = self.add_item_fixtures(ext="ogg")
+
+        self.io.addinput("y")
+        self.run_convert_path(item, "--format", "opus", "--force")
+
+        converted = self.convert_dest / "converted.ops"
+        assert self.file_endswith(converted, "opus")
+
+    def assert_playlist_entry(self, expected_entry, *args):
+        self.io.addinput("y")
+        self.run_convert(*args, "--playlist", "playlist.m3u8")
+        lines = (self.convert_dest / "playlist.m3u8").read_text().splitlines()
+        assert lines[0] == "#EXTM3U"
+        assert lines[1] == expected_entry
+
+    def test_playlist_entry_uses_config_format(self):
+        self.assert_playlist_entry("converted.mp3")
+
+    def test_playlist_entry_uses_cli_format(self):
+        self.assert_playlist_entry("converted.ops", "--format", "opus")
+
+    def test_playlist_entry_keeps_original_extension_when_not_transcoded(self):
+        self.config["convert"]["no_convert"] = "format:ogg"
+        self.assert_playlist_entry("converted.ogg")
+
+    def test_playlist_entry_keep_new_points_to_destination_file(self):
+        self.assert_playlist_entry("converted.ogg", "--keep-new")
 
 
 @_common.slow_test()
@@ -281,25 +329,38 @@ class NeverConvertLossyFilesTest(ConvertTestCase, ConvertCommand):
 
     def test_transcode_from_lossless(self):
         [item] = self.add_item_fixtures(ext="flac")
-        with control_stdin("y"):
-            self.run_convert_path(item)
+        self.io.addinput("y")
+        self.run_convert_path(item)
         converted = self.convert_dest / "converted.mp3"
         assert self.file_endswith(converted, "mp3")
 
     def test_transcode_from_lossy(self):
         self.config["convert"]["never_convert_lossy_files"] = False
         [item] = self.add_item_fixtures(ext="ogg")
-        with control_stdin("y"):
-            self.run_convert_path(item)
+        self.io.addinput("y")
+        self.run_convert_path(item)
         converted = self.convert_dest / "converted.mp3"
         assert self.file_endswith(converted, "mp3")
 
     def test_transcode_from_lossy_prevented(self):
         [item] = self.add_item_fixtures(ext="ogg")
-        with control_stdin("y"):
-            self.run_convert_path(item)
+        self.io.addinput("y")
+        self.run_convert_path(item)
         converted = self.convert_dest / "converted.ogg"
         assert not self.file_endswith(converted, "mp3")
+
+    def test_force_overrides_never_convert_lossy_files(self):
+        self.config["convert"]["formats"]["opus"] = {
+            "command": self.tagged_copy_cmd("opus"),
+            "extension": "ops",
+        }
+        [item] = self.add_item_fixtures(ext="ogg")
+
+        self.io.addinput("y")
+        self.run_convert_path(item, "--format", "opus", "--force")
+
+        converted = self.convert_dest / "converted.ops"
+        assert self.file_endswith(converted, "opus")
 
 
 class TestNoConvert:

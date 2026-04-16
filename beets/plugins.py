@@ -21,9 +21,9 @@ import inspect
 import re
 import sys
 from collections import defaultdict
-from functools import wraps
+from functools import cached_property, wraps
+from importlib import import_module
 from pathlib import Path
-from types import GenericAlias
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar
 
 import mediafile
@@ -32,11 +32,12 @@ from typing_extensions import ParamSpec
 import beets
 from beets import logging
 from beets.util import unique_list
+from beets.util.deprecation import deprecate_for_maintainers, deprecate_for_user
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    from confuse import ConfigView
+    from confuse import Subview
 
     from beets.dbcore import Query
     from beets.dbcore.db import FieldQueryType
@@ -57,7 +58,6 @@ if TYPE_CHECKING:
     P = ParamSpec("P")
     Ret = TypeVar("Ret", bound=Any)
     Listener = Callable[..., Any]
-    IterF = Callable[P, Iterable[Ret]]
 
 
 PLUGIN_NAMESPACE = "beetsplug"
@@ -70,6 +70,7 @@ EventType = Literal[
     "album_imported",
     "album_removed",
     "albuminfo_received",
+    "album_matched",
     "before_choose_candidate",
     "before_item_moved",
     "cli_exit",
@@ -139,7 +140,13 @@ class PluginLogFilter(logging.Filter):
 # Managing the plugins themselves.
 
 
-class BeetsPlugin(metaclass=abc.ABCMeta):
+class BeetsPluginMeta(abc.ABCMeta):
+    template_funcs: ClassVar[TFuncMap[str]] = {}
+    template_fields: ClassVar[TFuncMap[Item]] = {}
+    album_template_fields: ClassVar[TFuncMap[Album]] = {}
+
+
+class BeetsPlugin(metaclass=BeetsPluginMeta):
     """The base class for all beets plugins. Plugins provide
     functionality by defining a subclass of BeetsPlugin and overriding
     the abstract methods defined here.
@@ -149,29 +156,69 @@ class BeetsPlugin(metaclass=abc.ABCMeta):
         list
     )
     listeners: ClassVar[dict[EventType, list[Listener]]] = defaultdict(list)
-    template_funcs: TFuncMap[str] | None = None
-    template_fields: TFuncMap[Item] | None = None
-    album_template_fields: TFuncMap[Album] | None = None
+
+    template_funcs: TFuncMap[str]
+    template_fields: TFuncMap[Item]
+    album_template_fields: TFuncMap[Album]
 
     name: str
-    config: ConfigView
+    config: Subview
     early_import_stages: list[ImportStageFunc]
     import_stages: list[ImportStageFunc]
 
     def __init_subclass__(cls) -> None:
-        # Dynamically copy methods to BeetsPlugin for legacy support
-        # TODO: Remove this in the future major release, v3.0.0
+        """Enable legacy metadata source plugins to work with the new interface.
+
+        When a plugin subclass of BeetsPlugin defines a `data_source` attribute
+        but does not inherit from MetadataSourcePlugin, this hook:
+
+        1. Skips abstract classes.
+        2. Warns that the class should extend MetadataSourcePlugin (deprecation).
+        3. Copies any nonabstract methods from MetadataSourcePlugin onto the
+           subclass to provide the full plugin API.
+
+        This compatibility layer will be removed in the v3.0.0 release.
+        """
+        # TODO: Remove in v3.0.0
         if inspect.isabstract(cls):
             return
 
         from beets.metadata_plugins import MetadataSourcePlugin
 
-        abstractmethods = MetadataSourcePlugin.__abstractmethods__
-        for name, method in inspect.getmembers(
-            MetadataSourcePlugin, predicate=inspect.isfunction
+        if issubclass(cls, MetadataSourcePlugin) or not hasattr(
+            cls, "data_source"
         ):
-            if name not in abstractmethods and not hasattr(cls, name):
-                setattr(cls, name, method)
+            return
+
+        deprecate_for_maintainers(
+            (
+                f"'{cls.__name__}' is used as a legacy metadata source since it"
+                " inherits 'beets.plugins.BeetsPlugin'. Support for this"
+            ),
+            "'beets.metadata_plugins.MetadataSourcePlugin'",
+            stacklevel=3,
+        )
+
+        method: property | cached_property[Any] | Callable[..., Any]
+        for name, method in inspect.getmembers(
+            MetadataSourcePlugin,
+            predicate=lambda f: (  # type: ignore[arg-type]
+                (
+                    isinstance(f, (property, cached_property))
+                    and not hasattr(
+                        BeetsPlugin,
+                        getattr(f, "attrname", None) or f.fget.__name__,  # type: ignore[union-attr]
+                    )
+                )
+                or (
+                    inspect.isfunction(f)
+                    and f.__name__
+                    and not getattr(f, "__isabstractmethod__", False)
+                    and not hasattr(BeetsPlugin, f.__name__)
+                )
+            ),
+        ):
+            setattr(cls, name, method)
 
     def __init__(self, name: str | None = None):
         """Perform one-time plugin setup."""
@@ -179,14 +226,10 @@ class BeetsPlugin(metaclass=abc.ABCMeta):
         self.name = name or self.__module__.split(".")[-1]
         self.config = beets.config[self.name]
 
-        # Set class attributes if they are not already set
-        # for the type of plugin.
-        if not self.template_funcs:
-            self.template_funcs = {}
-        if not self.template_fields:
-            self.template_fields = {}
-        if not self.album_template_fields:
-            self.album_template_fields = {}
+        # create per-instance storage for template fields and functions
+        self.template_funcs = {}
+        self.template_fields = {}
+        self.album_template_fields = {}
 
         self.early_import_stages = []
         self.import_stages = []
@@ -195,6 +238,40 @@ class BeetsPlugin(metaclass=abc.ABCMeta):
         self._log.setLevel(logging.NOTSET)  # Use `beets` logger level.
         if not any(isinstance(f, PluginLogFilter) for f in self._log.filters):
             self._log.addFilter(PluginLogFilter(self))
+
+        # In order to verify the config we need to make sure the plugin is fully
+        # configured (plugins usually add the default configuration *after*
+        # calling super().__init__()).
+        self.register_listener("pluginload", self._verify_config)
+
+    def _verify_config(self, *_, **__) -> None:
+        """Verify plugin configuration.
+
+        If deprecated 'source_weight' option is explicitly set by the user, they
+        will see a warning in the logs. Otherwise, this must be configured by
+        a third party plugin, thus we raise a deprecation warning which won't be
+        shown to user but will be visible to plugin developers.
+        """
+        # TODO: Remove in v3.0.0
+        if (
+            not hasattr(self, "data_source")
+            or "source_weight" not in self.config
+        ):
+            return
+
+        for source in self.config.root().sources:
+            if "source_weight" in (source.get(self.name) or {}):
+                if source.filename:  # user config
+                    deprecate_for_user(
+                        self._log,
+                        f"'{self.name}.source_weight' configuration option",
+                        f"'{self.name}.data_source_mismatch_penalty'",
+                    )
+                else:  # 3rd-party plugin config
+                    deprecate_for_maintainers(
+                        "'source_weight' configuration option",
+                        "'data_source_mismatch_penalty'",
+                    )
 
     def commands(self) -> Sequence[Subcommand]:
         """Should return a list of beets.ui.Subcommand objects for
@@ -297,8 +374,6 @@ class BeetsPlugin(metaclass=abc.ABCMeta):
         """
 
         def helper(func: TFunc[str]) -> TFunc[str]:
-            if cls.template_funcs is None:
-                cls.template_funcs = {}
             cls.template_funcs[name] = func
             return func
 
@@ -313,8 +388,6 @@ class BeetsPlugin(metaclass=abc.ABCMeta):
         """
 
         def helper(func: TFunc[Item]) -> TFunc[Item]:
-            if cls.template_fields is None:
-                cls.template_fields = {}
             cls.template_fields[name] = func
             return func
 
@@ -343,16 +416,22 @@ def get_plugin_names() -> list[str]:
     # *contain* a `beetsplug` package.
     sys.path += paths
     plugins = unique_list(beets.config["plugins"].as_str_seq())
-    # TODO: Remove in v3.0.0
-    if (
-        "musicbrainz" not in plugins
-        and "musicbrainz" in beets.config
-        and beets.config["musicbrainz"].get().get("enabled")
-    ):
-        plugins.append("musicbrainz")
-
     beets.config.add({"disabled_plugins": []})
     disabled_plugins = set(beets.config["disabled_plugins"].as_str_seq())
+    # TODO: Remove in v3.0.0
+    mb_enabled = beets.config["musicbrainz"].flatten().get("enabled")
+    if mb_enabled:
+        deprecate_for_user(
+            log,
+            "'musicbrainz.enabled' configuration option",
+            "'plugins' configuration to explicitly add 'musicbrainz'",
+        )
+        if "musicbrainz" not in plugins:
+            plugins.append("musicbrainz")
+    elif mb_enabled is False:
+        deprecate_for_user(log, "'musicbrainz.enabled' configuration option")
+        disabled_plugins.add("musicbrainz")
+
     return [p for p in plugins if p not in disabled_plugins]
 
 
@@ -362,22 +441,31 @@ def _get_plugin(name: str) -> BeetsPlugin | None:
     Attempts to import the plugin module, locate the appropriate plugin class
     within it, and return an instance. Handles import failures gracefully and
     logs warnings for missing plugins or loading errors.
+
+    Note we load the *last* plugin class found in the plugin namespace. This
+    allows plugins to define helper classes that inherit from BeetsPlugin
+    without those being loaded as the main plugin class.
+
+    Returns None if the plugin could not be loaded for any reason.
     """
     try:
         try:
-            namespace = __import__(f"{PLUGIN_NAMESPACE}.{name}", None, None)
+            namespace = import_module(f"{PLUGIN_NAMESPACE}.{name}")
         except Exception as exc:
             raise PluginImportError(name) from exc
 
-        for obj in getattr(namespace, name).__dict__.values():
+        for obj in reversed(namespace.__dict__.values()):
             if (
                 inspect.isclass(obj)
-                and not isinstance(
-                    obj, GenericAlias
-                )  # seems to be needed for python <= 3.9 only
                 and issubclass(obj, BeetsPlugin)
                 and obj != BeetsPlugin
                 and not inspect.isabstract(obj)
+                # Only consider this plugin's module or submodules to avoid
+                # conflicts when plugins import other BeetsPlugin classes
+                and (
+                    obj.__module__ == namespace.__name__
+                    or obj.__module__.startswith(f"{namespace.__name__}.")
+                )
             ):
                 return obj()
 
@@ -459,7 +547,7 @@ def named_queries(model_cls: type[AnyModel]) -> dict[str, FieldQueryType]:
 
 def notify_info_yielded(
     event: EventType,
-) -> Callable[[IterF[P, Ret]], IterF[P, Ret]]:
+) -> Callable[[Callable[P, Iterable[Ret]]], Callable[P, Iterator[Ret]]]:
     """Makes a generator send the event 'event' every time it yields.
     This decorator is supposed to decorate a generator, but any function
     returning an iterable should work.
@@ -467,9 +555,11 @@ def notify_info_yielded(
     'send'.
     """
 
-    def decorator(func: IterF[P, Ret]) -> IterF[P, Ret]:
+    def decorator(
+        func: Callable[P, Iterable[Ret]],
+    ) -> Callable[P, Iterator[Ret]]:
         @wraps(func)
-        def wrapper(*args: P.args, **kwargs: P.kwargs) -> Iterable[Ret]:
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> Iterator[Ret]:
             for v in func(*args, **kwargs):
                 send(event, info=v)
                 yield v
@@ -485,8 +575,7 @@ def template_funcs() -> TFuncMap[str]:
     """
     funcs: TFuncMap[str] = {}
     for plugin in find_plugins():
-        if plugin.template_funcs:
-            funcs.update(plugin.template_funcs)
+        funcs.update(plugin.template_funcs)
     return funcs
 
 
@@ -512,21 +601,20 @@ F = TypeVar("F")
 
 
 def _check_conflicts_and_merge(
-    plugin: BeetsPlugin, plugin_funcs: dict[str, F] | None, funcs: dict[str, F]
+    plugin: BeetsPlugin, plugin_funcs: dict[str, F], funcs: dict[str, F]
 ) -> None:
     """Check the provided template functions for conflicts and merge into funcs.
 
     Raises a `PluginConflictError` if a plugin defines template functions
     for fields that another plugin has already defined template functions for.
     """
-    if plugin_funcs:
-        if not plugin_funcs.keys().isdisjoint(funcs.keys()):
-            conflicted_fields = ", ".join(plugin_funcs.keys() & funcs.keys())
-            raise PluginConflictError(
-                f"Plugin {plugin.name} defines template functions for "
-                f"{conflicted_fields} that conflict with another plugin."
-            )
-        funcs.update(plugin_funcs)
+    if not plugin_funcs.keys().isdisjoint(funcs.keys()):
+        conflicted_fields = ", ".join(plugin_funcs.keys() & funcs.keys())
+        raise PluginConflictError(
+            f"Plugin {plugin.name} defines template functions for "
+            f"{conflicted_fields} that conflict with another plugin."
+        )
+    funcs.update(plugin_funcs)
 
 
 def item_field_getters() -> TFuncMap[Item]:
@@ -566,13 +654,17 @@ def send(event: EventType, **arguments: Any) -> list[Any]:
     ]
 
 
-def feat_tokens(for_artist: bool = True) -> str:
+def feat_tokens(
+    for_artist: bool = True, custom_words: list[str] | None = None
+) -> str:
     """Return a regular expression that matches phrases like "featuring"
     that separate a main artist or a song title from secondary artists.
     The `for_artist` option determines whether the regex should be
     suitable for matching artist fields (the default) or title fields.
     """
     feat_words = ["ft", "featuring", "feat", "feat.", "ft."]
+    if isinstance(custom_words, list):
+        feat_words += custom_words
     if for_artist:
         feat_words += ["with", "vs", "and", "con", "&"]
     return (

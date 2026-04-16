@@ -10,11 +10,13 @@ from unidecode import unidecode
 
 from beets import config, metadata_plugins
 from beets.util import as_string, cached_classproperty, get_most_common_tags
+from beets.util.color import colorize
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
 
     from beets.library import Item
+    from beets.util.color import ColorName
 
     from .hooks import AlbumInfo, TrackInfo
 
@@ -139,6 +141,13 @@ class Distance:
             weights[key] = weights_view[key].as_number()
         return weights
 
+    @property
+    def generic_penalty_keys(self) -> list[str]:
+        return [
+            k.replace("album_", "").replace("track_", "").replace("_", " ")
+            for k in self._penalties
+        ]
+
     # Access the components and their aggregates.
 
     @property
@@ -166,6 +175,18 @@ class Distance:
         for key, penalty in self._penalties.items():
             dist_raw += sum(penalty) * self._weights[key]
         return dist_raw
+
+    @property
+    def color(self) -> ColorName:
+        if self.distance <= config["match"]["strong_rec_thresh"].as_number():
+            return "text_success"
+        if self.distance <= config["match"]["medium_rec_thresh"].as_number():
+            return "text_warning"
+        return "text_error"
+
+    @property
+    def string(self) -> str:
+        return colorize(self.color, f"{(1 - self.distance) * 100:.1f}%")
 
     def items(self) -> list[tuple[str, float]]:
         """Return a list of (key, dist) pairs, with `dist` being the
@@ -345,6 +366,12 @@ class Distance:
         dist = string_dist(str1, str2)
         self.add(key, dist)
 
+    def add_data_source(self, before: str | None, after: str | None) -> None:
+        if before != after and (
+            before or len(metadata_plugins.find_metadata_source_plugins()) > 1
+        ):
+            self.add("data_source", metadata_plugins.get_penalty(after))
+
 
 @cache
 def get_track_length_grace() -> float:
@@ -408,8 +435,7 @@ def track_distance(
     if track_info.medium and item.disc:
         dist.add_expr("medium", item.disc != track_info.medium)
 
-    # Plugins.
-    dist.update(metadata_plugins.track_distance(item, track_info))
+    dist.add_data_source(item.get("data_source"), track_info.data_source)
 
     return dist
 
@@ -417,7 +443,7 @@ def track_distance(
 def distance(
     items: Sequence[Item],
     album_info: AlbumInfo,
-    mapping: dict[Item, TrackInfo],
+    item_info_pairs: list[tuple[Item, TrackInfo]],
 ) -> Distance:
     """Determines how "significant" an album metadata change would be.
     Returns a Distance object. `album_info` is an AlbumInfo object
@@ -513,19 +539,18 @@ def distance(
 
     # Tracks.
     dist.tracks = {}
-    for item, track in mapping.items():
+    for item, track in item_info_pairs:
         dist.tracks[track] = track_distance(item, track, album_info.va)
         dist.add("tracks", dist.tracks[track].distance)
 
     # Missing tracks.
-    for _ in range(len(album_info.tracks) - len(mapping)):
+    for _ in range(len(album_info.tracks) - len(item_info_pairs)):
         dist.add("missing_tracks", 1.0)
 
     # Unmatched tracks.
-    for _ in range(len(items) - len(mapping)):
+    for _ in range(len(items) - len(item_info_pairs)):
         dist.add("unmatched_tracks", 1.0)
 
-    # Plugins.
-    dist.update(metadata_plugins.album_distance(items, album_info, mapping))
+    dist.add_data_source(likelies["data_source"], album_info.data_source)
 
     return dist

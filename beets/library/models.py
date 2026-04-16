@@ -5,15 +5,17 @@ import string
 import sys
 import time
 import unicodedata
+from contextlib import suppress
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from mediafile import MediaFile, UnreadableFileError
 
 import beets
 from beets import dbcore, logging, plugins, util
 from beets.dbcore import types
+from beets.dbcore.pathutils import normalize_path_for_db
 from beets.util import (
     MoveOperation,
     bytestring_path,
@@ -22,6 +24,7 @@ from beets.util import (
     samefile,
     syspath,
 )
+from beets.util.deprecation import maybe_replace_legacy_field
 from beets.util.functemplate import Template, template
 
 from .exceptions import FileOperationError, ReadError, WriteError
@@ -40,6 +43,7 @@ class LibModel(dbcore.Model["Library"]):
     # Config key that specifies how an instance should be formatted.
     _format_config_key: str
     path: bytes
+    length: float
 
     @cached_classproperty
     def _types(cls) -> dict[str, types.Type]:
@@ -99,7 +103,20 @@ class LibModel(dbcore.Model["Library"]):
         cls, field: str, pattern: str, query_cls: FieldQueryType
     ) -> FieldQuery:
         """Get a `FieldQuery` for the given field on this model."""
+        field = maybe_replace_legacy_field(field, cls is Album)
+
         fast = field in cls.all_db_fields
+        if (
+            cls._type(field).query is dbcore.query.PathQuery
+            and query_cls is not dbcore.query.PathQuery
+        ):
+            # Regex, exact, and string queries operate on the raw DB value, so
+            # strip the library prefix to match the stored relative path.
+            bytes_pattern = normalize_path_for_db(util.bytestring_path(pattern))
+            if query_cls is not dbcore.query.RegexpQuery:
+                bytes_pattern = util.path_as_posix(bytes_pattern)
+            pattern = os.fsdecode(bytes_pattern)
+
         if field in cls.shared_db_fields:
             # This field exists in both tables, so SQLite will encounter
             # an OperationalError if we try to use it in a query.
@@ -229,7 +246,7 @@ class Album(LibModel):
     _table = "albums"
     _flex_table = "album_attributes"
     _always_dirty = True
-    _fields = {
+    _fields: ClassVar[dict[str, types.Type]] = {
         "id": types.PRIMARY_ID,
         "artpath": types.NullPathType(),
         "added": types.DATE,
@@ -240,7 +257,7 @@ class Album(LibModel):
         "albumartists_sort": types.MULTI_VALUE_DSV,
         "albumartists_credit": types.MULTI_VALUE_DSV,
         "album": types.STRING,
-        "genre": types.STRING,
+        "genres": types.MULTI_VALUE_DSV,
         "style": types.STRING,
         "discogs_albumid": types.INTEGER,
         "discogs_artistid": types.INTEGER,
@@ -275,19 +292,19 @@ class Album(LibModel):
         "original_day": types.PaddedInt(2),
     }
 
-    _search_fields = ("album", "albumartist", "genre")
+    _search_fields = ("album", "albumartist", "genres")
 
     @cached_classproperty
     def _types(cls) -> dict[str, types.Type]:
         return {**super()._types, "path": types.PathType()}
 
-    _sorts = {
+    _sorts: ClassVar[dict[str, type[dbcore.query.FieldSort]]] = {
         "albumartist": dbcore.query.SmartArtistSort,
         "artist": dbcore.query.SmartArtistSort,
     }
 
     # List of keys that are set on an album's items.
-    item_keys = [
+    item_keys: ClassVar[list[str]] = [
         "added",
         "albumartist",
         "albumartists",
@@ -296,7 +313,7 @@ class Album(LibModel):
         "albumartist_credit",
         "albumartists_credit",
         "album",
-        "genre",
+        "genres",
         "style",
         "discogs_albumid",
         "discogs_artistid",
@@ -616,13 +633,20 @@ class Album(LibModel):
         for item in self.items():
             item.try_sync(write, move)
 
+    @cached_property
+    def length(self) -> float:  # type: ignore[override] # still writable since we override __setattr__
+        """Return the total length of all items in this album in seconds."""
+        return sum(item.length for item in self.items())
+
 
 class Item(LibModel):
     """Represent a song or track."""
 
+    album_id: int | None
+
     _table = "items"
     _flex_table = "item_attributes"
-    _fields = {
+    _fields: ClassVar[dict[str, types.Type]] = {
         "id": types.PRIMARY_ID,
         "path": types.PathType(),
         "album_id": types.FOREIGN_ID,
@@ -634,7 +658,8 @@ class Item(LibModel):
         "artists_sort": types.MULTI_VALUE_DSV,
         "artist_credit": types.STRING,
         "artists_credit": types.MULTI_VALUE_DSV,
-        "remixer": types.STRING,
+        "remixers": types.MULTI_VALUE_DSV,
+        "remixers_ids": types.MULTI_VALUE_DSV,
         "album": types.STRING,
         "albumartist": types.STRING,
         "albumartists": types.MULTI_VALUE_DSV,
@@ -642,18 +667,21 @@ class Item(LibModel):
         "albumartists_sort": types.MULTI_VALUE_DSV,
         "albumartist_credit": types.STRING,
         "albumartists_credit": types.MULTI_VALUE_DSV,
-        "genre": types.STRING,
+        "genres": types.MULTI_VALUE_DSV,
         "style": types.STRING,
         "discogs_albumid": types.INTEGER,
         "discogs_artistid": types.INTEGER,
         "discogs_labelid": types.INTEGER,
-        "lyricist": types.STRING,
-        "composer": types.STRING,
+        "lyricists": types.MULTI_VALUE_DSV,
+        "lyricists_ids": types.MULTI_VALUE_DSV,
+        "composers": types.MULTI_VALUE_DSV,
         "composer_sort": types.STRING,
+        "composers_ids": types.MULTI_VALUE_DSV,
         "work": types.STRING,
         "mb_workid": types.STRING,
         "work_disambig": types.STRING,
-        "arranger": types.STRING,
+        "arrangers": types.MULTI_VALUE_DSV,
+        "arrangers_ids": types.MULTI_VALUE_DSV,
         "grouping": types.STRING,
         "year": types.PaddedInt(4),
         "month": types.PaddedInt(2),
@@ -716,6 +744,7 @@ class Item(LibModel):
         "mtime": types.DATE,
         "added": types.DATE,
     }
+    _indices = (dbcore.Index("idx_item_album_id", ("album_id",)),)
 
     _search_fields = (
         "artist",
@@ -723,7 +752,7 @@ class Item(LibModel):
         "comments",
         "album",
         "albumartist",
-        "genre",
+        "genres",
     )
 
     # Set of item fields that are backed by `MediaFile` fields.
@@ -742,7 +771,9 @@ class Item(LibModel):
 
     _formatter = FormattedItemMapping
 
-    _sorts = {"artist": dbcore.query.SmartArtistSort}
+    _sorts: ClassVar[dict[str, type[dbcore.query.FieldSort]]] = {
+        "artist": dbcore.query.SmartArtistSort
+    }
 
     @cached_classproperty
     def _queries(cls) -> dict[str, FieldQueryType]:
@@ -794,6 +825,7 @@ class Item(LibModel):
         getters = plugins.item_field_getters()
         getters["singleton"] = lambda i: i.album_id is None
         getters["filesize"] = Item.try_filesize  # In bytes.
+        getters["has_cover_art"] = Item.has_cover_art
         return getters
 
     def duplicates_query(self, fields: list[str]) -> dbcore.AndQuery:
@@ -1087,6 +1119,17 @@ class Item(LibModel):
             log.warning("could not get filesize: {}", exc)
             return 0
 
+    def has_cover_art(self):
+        """Check if item has embedded cover art.
+
+        Return True if images embedded in file, False otherwise.
+        If file unreadable or no images, return False.
+        """
+        with suppress(OSError):
+            return bool(MediaFile(self.path).images)
+
+        return False
+
     # Model methods.
 
     def remove(self, delete=False, with_album=True):
@@ -1143,7 +1186,6 @@ class Item(LibModel):
         If `store` is `False` however, the item won't be stored and it will
         have to be manually stored after invoking this method.
         """
-        self._check_db()
         dest = self.destination(basedir=basedir)
 
         # Create necessary ancestry for the move.
@@ -1183,9 +1225,8 @@ class Item(LibModel):
         is true, returns just the fragment of the path underneath the library
         base directory.
         """
-        db = self._check_db()
-        basedir = basedir or db.directory
-        path_formats = path_formats or db.path_formats
+        basedir = basedir or self.db.directory
+        path_formats = path_formats or self.db.path_formats
 
         # Use a path format based on a query, falling back on the
         # default.
@@ -1224,7 +1265,7 @@ class Item(LibModel):
             )
 
         lib_path_str, fallback = util.legalize_path(
-            subpath, db.replacements, self.filepath.suffix
+            subpath, self.db.replacements, self.filepath.suffix
         )
         if fallback:
             # Print an error message if legalization fell back to
@@ -1537,8 +1578,8 @@ class DefaultTemplateFunctions:
             s: the string
             count: The number of items included
             skip: The number of items skipped
-            sep: the separator. Usually is '; ' (default) or '/ '
-            join_str: the string which will join the items, default '; '.
+            sep: the separator
+            join_str: the string which will join the items
         """
         skip = int(skip)
         count = skip + int(count)

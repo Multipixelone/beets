@@ -6,6 +6,11 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
+import sys
+from pathlib import Path
+
+# Add custom extensions directory to path
+sys.path.insert(0, str(Path(__file__).parent / "extensions"))
 
 project = "beets"
 AUTHOR = "Adrian Sampson"
@@ -13,8 +18,8 @@ copyright = "2016, Adrian Sampson"
 
 master_doc = "index"
 language = "en"
-version = "2.4"
-release = "2.4.0"
+version = "2.9"
+release = "2.9.0"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -23,12 +28,30 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinx.ext.extlinks",
+    "sphinx.ext.viewcode",
+    "sphinx_design",
+    "sphinx_copybutton",
+    "conf",
+    "sphinx_toolbox.more_autodoc.autotypeddict",
+    "sphinx_toolbox.more_autodoc.autonamedtuple",
 ]
+
 autosummary_generate = True
+autosummary_context = {
+    "related_typeddicts": {
+        "MusicBrainzAPI": [
+            "beetsplug._utils.musicbrainz.LookupKwargs",
+            "beetsplug._utils.musicbrainz.SearchKwargs",
+            "beetsplug._utils.musicbrainz.BrowseKwargs",
+            "beetsplug._utils.musicbrainz.BrowseRecordingsKwargs",
+            "beetsplug._utils.musicbrainz.BrowseReleaseGroupsKwargs",
+        ],
+    }
+}
+autodoc_member_order = "bysource"
 exclude_patterns = ["_build"]
 templates_path = ["_templates"]
 source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
-
 
 pygments_style = "sphinx"
 
@@ -47,6 +70,11 @@ linkcheck_ignore = [
     r"https?://127\.0\.0\.1",
     r"https://www.musixmatch.com/",  # blocks requests
     r"https://genius.com/",  # blocks requests
+    r"https://sourceforge\.net/",  # blocks requests
+    r"https://[^/]*fanart\.tv/",  # blocks requests
+    r"https://[^/]*fandom\.com/",  # blocks requests
+    r"https://imgur\.com/",  # not accessible from the UK
+    r"https://www.discogs.com/settings/developers",  # requires login
 ]
 
 # Options for HTML output
@@ -76,15 +104,17 @@ man_pages = [
 ]
 
 # Global substitutions that can be used anywhere in the documentation.
-rst_epilog = """
+rst_epilog = r"""
 .. |Album| replace:: :class:`~beets.library.models.Album`
 .. |AlbumInfo| replace:: :class:`beets.autotag.hooks.AlbumInfo`
+.. |BeetsPlugin| replace:: :class:`beets.plugins.BeetsPlugin`
 .. |ImportSession| replace:: :class:`~beets.importer.session.ImportSession`
 .. |ImportTask| replace:: :class:`~beets.importer.tasks.ImportTask`
 .. |Item| replace:: :class:`~beets.library.models.Item`
 .. |Library| replace:: :class:`~beets.library.library.Library`
 .. |Model| replace:: :class:`~beets.dbcore.db.Model`
 .. |TrackInfo| replace:: :class:`beets.autotag.hooks.TrackInfo`
+.. |semicolon_space| replace:: :literal:`; \ `
 """
 
 # -- Options for HTML output -------------------------------------------------

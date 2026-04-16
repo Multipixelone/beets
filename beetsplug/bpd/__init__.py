@@ -26,19 +26,18 @@ import sys
 import time
 import traceback
 from string import Template
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import beets
 import beets.ui
-from beets import dbcore, logging, vfs
+from beets import dbcore
 from beets.library import Item
 from beets.plugins import BeetsPlugin
 from beets.util import as_string, bluelet
+from beetsplug._utils import vfs
 
 if TYPE_CHECKING:
     from beets.dbcore.query import Query
-
-log = logging.getLogger(__name__)
 
 
 try:
@@ -282,7 +281,7 @@ class BaseServer:
         if not self.ctrl_sock:
             self.ctrl_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.ctrl_sock.connect((self.ctrl_host, self.ctrl_port))
-        self.ctrl_sock.sendall((f"{message}\n").encode("utf-8"))
+        self.ctrl_sock.sendall((f"{message}\n").encode())
 
     def _send_event(self, event):
         """Notify subscribed connections of an event."""
@@ -1036,7 +1035,7 @@ class Command:
             raise BPDError(ERROR_PERMISSION, "insufficient privileges")
 
         try:
-            args = [conn] + self.args
+            args = [conn, *self.args]
             results = func(*args)
             if results:
                 for data in results:
@@ -1138,7 +1137,10 @@ class Server(BaseServer):
             pass
 
         for tagtype, field in self.tagtype_map.items():
-            info_lines.append(f"{tagtype}: {getattr(item, field)}")
+            field_value = getattr(item, field)
+            if isinstance(field_value, list):
+                field_value = "; ".join(field_value)
+            info_lines.append(f"{tagtype}: {field_value}")
 
         return info_lines
 
@@ -1343,7 +1345,7 @@ class Server(BaseServer):
 
     # Searching.
 
-    tagtype_map = {
+    tagtype_map: ClassVar[dict[str, str]] = {
         "Artist": "artist",
         "ArtistSort": "artist_sort",
         "Album": "album",
@@ -1352,10 +1354,10 @@ class Server(BaseServer):
         "AlbumArtist": "albumartist",
         "AlbumArtistSort": "albumartist_sort",
         "Label": "label",
-        "Genre": "genre",
+        "Genre": "genres",
         "Date": "year",
         "OriginalDate": "original_year",
-        "Composer": "composer",
+        "Composer": "composers",
         "Disc": "disc",
         "Comment": "comments",
         "MUSICBRAINZ_TRACKID": "mb_trackid",

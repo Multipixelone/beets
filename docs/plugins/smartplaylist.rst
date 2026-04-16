@@ -121,7 +121,7 @@ instance the following configuration exports the ``id`` and ``genre`` fields:
         output: extm3u
         fields:
             - id
-            - genre
+            - genres
         playlists:
             - name: all.m3u
               query: ''
@@ -132,7 +132,7 @@ look as follows:
 ::
 
     #EXTM3U
-    #EXTINF:805 id="1931" genre="Progressive%20Rock",Led Zeppelin - Stairway to Heaven
+    #EXTINF:805 id="1931" genres="Rock%3B%20Pop",Led Zeppelin - Stairway to Heaven
     ../music/singles/Led Zeppelin/Stairway to Heaven.mp3
 
 To give a usage example, the webm3u_ and Beetstream_ plugins read the exported
@@ -153,6 +153,11 @@ options are:
   ``yes``.
 - **playlist_dir**: Where to put the generated playlist files. Default: The
   current working directory (i.e., ``'.'``).
+- **dest_regen**: Regenerate the destination path as ``move`` or ``convert``
+  commands would do. This operation will happen before ``relative_to`` and
+  ``prefix``. Helpful to generate playlists compatible with the ``convert``
+  plugin when items have been imported with the ``-C -M`` options. Default:
+  ``false``.
 - **relative_to**: Generate paths in the playlist files relative to a base
   directory. If you intend to use this plugin to generate playlists for MPD,
   point this to your MPD music directory. Default: Use absolute paths.
@@ -167,8 +172,8 @@ options are:
   that will be written to the m3u file. Default: ``false``.
 - **uri_format**: Template with an ``$id`` placeholder used generate a playlist
   item URI, e.g. ``http://beets:8337/item/$id/file``. When this option is
-  specified, the local path-related options ``prefix``, ``relative_to``,
-  ``forward_slash`` and ``urlencode`` are ignored.
+  specified, the local path-related options ``dest_regen``, ``prefix``,
+  ``relative_to``, ``forward_slash`` and ``urlencode`` are ignored.
 - **output**: Specify the playlist format: m3u|extm3u. Default ``m3u``.
 - **fields**: Specify the names of the additional item fields to export into the
   playlist. This allows using e.g. the ``id`` field within other tools such as
@@ -176,6 +181,7 @@ options are:
   ``output`` option to ``extm3u``.
 
 For many configuration options, there is a corresponding CLI option, e.g.
-``--playlist-dir``, ``--relative-to``, ``--prefix``, ``--forward-slash``,
-``--urlencode``, ``--uri-format``, ``--output``, ``--pretend-paths``. CLI
-options take precedence over those specified within the configuration file.
+``--playlist-dir``, ``--dest-regen``, ``--relative-to``, ``--prefix``,
+``--forward-slash``, ``--urlencode``, ``--uri-format``, ``--output``,
+``--pretend-paths``. CLI options take precedence over those specified within the
+configuration file.

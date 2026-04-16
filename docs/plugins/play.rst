@@ -107,9 +107,25 @@ string, use ``$args`` to indicate where to insert them. For example:
 indicates that you need to insert extra arguments before specifying the
 playlist.
 
+Some players require a different syntax. For example, with ``mpv`` the optional
+``$playlist`` variable can be used to match the syntax of the ``--playlist``
+option:
+
+::
+
+    play:
+        command: mpv $args --playlist=$playlist
+
 The ``--yes`` (or ``-y``) flag to the ``play`` command will skip the warning
 message if you choose to play more items than the **warning_threshold** value
 usually allows.
+
+The ``--randomize`` (or ``-R``) flag shuffles the order of playlist entries
+before passing it to the player:
+
+::
+
+    $ beet play --randomize my query
 
 Note on the Leakage of the Generated Playlists
 ----------------------------------------------
@@ -123,4 +139,4 @@ until they are externally wiped could be an issue for privacy or storage
 reasons. If this is the case for you, you might want to use the ``raw`` config
 option described above.
 
-.. _tempfile.tempdir: https://docs.python.org/2/library/tempfile.html#tempfile.tempdir
+.. _tempfile.tempdir: https://docs.python.org/3/library/tempfile.html#tempfile.tempdir

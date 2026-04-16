@@ -17,26 +17,73 @@
 from __future__ import annotations
 
 import re
+from functools import cached_property, lru_cache
 from typing import TYPE_CHECKING
 
-from beets import plugins, ui
+from beets import config, plugins, ui
 
 if TYPE_CHECKING:
     from beets.importer import ImportSession, ImportTask
-    from beets.library import Item
+    from beets.library import Album, Item
+
+
+DEFAULT_BRACKET_KEYWORDS: tuple[str, ...] = (
+    "abridged",
+    "acapella",
+    "club",
+    "demo",
+    "edit",
+    "edition",
+    "extended",
+    "instrumental",
+    "live",
+    "mix",
+    "radio",
+    "release",
+    "remaster",
+    "remastered",
+    "remix",
+    "rmx",
+    "unabridged",
+    "unreleased",
+    "version",
+    "vip",
+)
 
 
 def split_on_feat(
-    artist: str, for_artist: bool = True
+    artist: str,
+    for_artist: bool = True,
+    custom_words: list[str] | None = None,
 ) -> tuple[str, str | None]:
     """Given an artist string, split the "main" artist from any artist
     on the right-hand side of a string like "feat". Return the main
     artist, which is always a string, and the featuring artist, which
     may be a string or None if none is present.
     """
-    # split on the first "feat".
-    regex = re.compile(plugins.feat_tokens(for_artist), re.IGNORECASE)
-    parts = tuple(s.strip() for s in regex.split(artist, 1))
+    # Try explicit featuring tokens first (ft, feat, featuring, etc.)
+    # to avoid splitting on generic separators like "&" when both are present
+    regex_explicit = re.compile(
+        plugins.feat_tokens(for_artist=False, custom_words=custom_words),
+        re.IGNORECASE,
+    )
+    parts = tuple(s.strip() for s in regex_explicit.split(artist, 1))
+    if len(parts) == 2:
+        return parts
+
+    # Try comma as separator
+    # (e.g. "Alice, Bob & Charlie" where Bob and Charlie are featuring)
+    if for_artist and "," in artist:
+        comma_parts = artist.split(",", 1)
+        return comma_parts[0].strip(), comma_parts[1].strip()
+
+    # Fall back to all tokens including generic separators if no explicit match
+    if for_artist:
+        regex = re.compile(
+            plugins.feat_tokens(for_artist, custom_words), re.IGNORECASE
+        )
+        parts = tuple(s.strip() for s in regex.split(artist, 1))
+
     if len(parts) == 1:
         return parts[0], None
     else:
@@ -44,18 +91,22 @@ def split_on_feat(
         return parts
 
 
-def contains_feat(title: str) -> bool:
+def contains_feat(title: str, custom_words: list[str] | None = None) -> bool:
     """Determine whether the title contains a "featured" marker."""
     return bool(
         re.search(
-            plugins.feat_tokens(for_artist=False),
+            plugins.feat_tokens(for_artist=False, custom_words=custom_words),
             title,
             flags=re.IGNORECASE,
         )
     )
 
 
-def find_feat_part(artist: str, albumartist: str | None) -> str | None:
+def find_feat_part(
+    artist: str,
+    albumartist: str | None,
+    custom_words: list[str] | None = None,
+) -> str | None:
     """Attempt to find featured artists in the item's artist fields and
     return the results. Returns None if no featured artist found.
     """
@@ -69,24 +120,67 @@ def find_feat_part(artist: str, albumartist: str | None) -> str | None:
         # featured artist.
         if albumartist_split[1] != "":
             # Extract the featured artist from the right-hand side.
-            _, feat_part = split_on_feat(albumartist_split[1])
+            _, feat_part = split_on_feat(
+                albumartist_split[1], custom_words=custom_words
+            )
             return feat_part
 
         # Otherwise, if there's nothing on the right-hand side,
         # look for a featuring artist on the left-hand side.
         else:
-            lhs, _ = split_on_feat(albumartist_split[0])
+            lhs, _ = split_on_feat(
+                albumartist_split[0], custom_words=custom_words
+            )
             if lhs:
                 return lhs
 
     # Fall back to conservative handling of the track artist without relying
     # on albumartist, which covers compilations using a 'Various Artists'
     # albumartist and album tracks by a guest artist featuring a third artist.
-    _, feat_part = split_on_feat(artist, False)
+    _, feat_part = split_on_feat(artist, False, custom_words)
     return feat_part
 
 
+def _album_artist_no_feat(album: Album) -> str:
+    custom_words = config["ftintitle"]["custom_words"].as_str_seq()
+    return split_on_feat(album["albumartist"], False, list(custom_words))[0]
+
+
 class FtInTitlePlugin(plugins.BeetsPlugin):
+    @cached_property
+    def bracket_keywords(self) -> list[str]:
+        return self.config["bracket_keywords"].as_str_seq()
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _bracket_position_pattern(keywords: tuple[str, ...]) -> re.Pattern[str]:
+        """
+        Build a compiled regex to find the first bracketed segment that contains
+        any of the provided keywords.
+
+        Cached by keyword tuple to avoid recompiling on every track/title.
+        """
+        kw_inner = "|".join(map(re.escape, keywords))
+
+        # If we have keywords, require one of them to appear in the bracket text.
+        # If kw == "", the lookahead becomes true and we match any bracket content.
+        kw = rf"\b(?={kw_inner})\b" if kw_inner else ""
+        return re.compile(
+            rf"""
+            (?:   # non-capturing group for the split
+              \s*?  # optional whitespace before brackets
+              (?=     # any bracket containing a keyword
+                    \([^)]*{kw}.*?\)
+                |   \[[^]]*{kw}.*?\]
+                |    <[^>]*{kw}.*? >
+                | \{{[^}}]*{kw}.*?\}}
+                | $   # or the end of the string
+              )
+            )
+            """,
+            re.IGNORECASE | re.VERBOSE,
+        )
+
     def __init__(self) -> None:
         super().__init__()
 
@@ -96,6 +190,9 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
                 "drop": False,
                 "format": "feat. {}",
                 "keep_in_artist": False,
+                "preserve_album_artist": True,
+                "custom_words": [],
+                "bracket_keywords": list(DEFAULT_BRACKET_KEYWORDS),
             }
         )
 
@@ -115,15 +212,29 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
         if self.config["auto"]:
             self.import_stages = [self.imported]
 
+        self.album_template_fields["album_artist_no_feat"] = (
+            _album_artist_no_feat
+        )
+
     def commands(self) -> list[ui.Subcommand]:
         def func(lib, opts, args):
             self.config.set_args(opts)
             drop_feat = self.config["drop"].get(bool)
             keep_in_artist_field = self.config["keep_in_artist"].get(bool)
+            preserve_album_artist = self.config["preserve_album_artist"].get(
+                bool
+            )
+            custom_words = self.config["custom_words"].get(list)
             write = ui.should_write()
 
             for item in lib.items(args):
-                if self.ft_in_title(item, drop_feat, keep_in_artist_field):
+                if self.ft_in_title(
+                    item,
+                    drop_feat,
+                    keep_in_artist_field,
+                    preserve_album_artist,
+                    custom_words,
+                ):
                     item.store()
                     if write:
                         item.try_write()
@@ -135,9 +246,17 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
         """Import hook for moving featuring artist automatically."""
         drop_feat = self.config["drop"].get(bool)
         keep_in_artist_field = self.config["keep_in_artist"].get(bool)
+        preserve_album_artist = self.config["preserve_album_artist"].get(bool)
+        custom_words = self.config["custom_words"].get(list)
 
         for item in task.imported_items():
-            if self.ft_in_title(item, drop_feat, keep_in_artist_field):
+            if self.ft_in_title(
+                item,
+                drop_feat,
+                keep_in_artist_field,
+                preserve_album_artist,
+                custom_words,
+            ):
                 item.store()
 
     def update_metadata(
@@ -146,6 +265,7 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
         feat_part: str,
         drop_feat: bool,
         keep_in_artist_field: bool,
+        custom_words: list[str],
     ) -> None:
         """Choose how to add new artists to the title and set the new
         metadata. Also, print out messages about any changes that are made.
@@ -158,20 +278,26 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
                 "artist: {.artist} (Not changing due to keep_in_artist)", item
             )
         else:
-            track_artist, _ = split_on_feat(item.artist)
+            track_artist, _ = split_on_feat(
+                item.artist, custom_words=custom_words
+            )
             self._log.info("artist: {0.artist} -> {1}", item, track_artist)
             item.artist = track_artist
 
         if item.artist_sort:
             # Just strip the featured artist from the sort name.
-            item.artist_sort, _ = split_on_feat(item.artist_sort)
+            item.artist_sort, _ = split_on_feat(
+                item.artist_sort, custom_words=custom_words
+            )
 
         # Only update the title if it does not already contain a featured
         # artist and if we do not drop featuring information.
-        if not drop_feat and not contains_feat(item.title):
+        if not drop_feat and not contains_feat(item.title, custom_words):
             feat_format = self.config["format"].as_str()
-            new_format = feat_format.format(feat_part)
-            new_title = f"{item.title} {new_format}"
+            formatted = feat_format.format(feat_part)
+            new_title = self.insert_ft_into_title(
+                item.title, formatted, self.bracket_keywords
+            )
             self._log.info("title: {.title} -> {}", item, new_title)
             item.title = new_title
 
@@ -180,6 +306,8 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
         item: Item,
         drop_feat: bool,
         keep_in_artist_field: bool,
+        preserve_album_artist: bool,
+        custom_words: list[str],
     ) -> bool:
         """Look for featured artists in the item's artist fields and move
         them to the title.
@@ -193,22 +321,38 @@ class FtInTitlePlugin(plugins.BeetsPlugin):
         # Check whether there is a featured artist on this track and the
         # artist field does not exactly match the album artist field. In
         # that case, we attempt to move the featured artist to the title.
-        if albumartist and artist == albumartist:
+        if preserve_album_artist and albumartist and artist == albumartist:
             return False
 
-        _, featured = split_on_feat(artist)
+        _, featured = split_on_feat(artist, custom_words=custom_words)
         if not featured:
             return False
 
         self._log.info("{.filepath}", item)
 
         # Attempt to find the featured artist.
-        feat_part = find_feat_part(artist, albumartist)
+        feat_part = find_feat_part(artist, albumartist, custom_words)
 
         if not feat_part:
             self._log.info("no featuring artists found")
             return False
 
         # If we have a featuring artist, move it to the title.
-        self.update_metadata(item, feat_part, drop_feat, keep_in_artist_field)
+        self.update_metadata(
+            item, feat_part, drop_feat, keep_in_artist_field, custom_words
+        )
         return True
+
+    @classmethod
+    def insert_ft_into_title(
+        cls, title: str, feat_part: str, keywords: list[str] | None = None
+    ) -> str:
+        """Insert featured artist before the first bracket containing
+        remix/edit keywords if present.
+        """
+        normalized = (
+            DEFAULT_BRACKET_KEYWORDS if keywords is None else tuple(keywords)
+        )
+        pattern = cls._bracket_position_pattern(normalized)
+        parts = pattern.split(title, maxsplit=1)
+        return f" {feat_part} ".join(parts).strip()

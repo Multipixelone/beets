@@ -41,6 +41,7 @@ class ZeroPlugin(BeetsPlugin):
                 "fields": [],
                 "keep_fields": [],
                 "update_database": False,
+                "omit_single_disc": False,
             }
         )
 
@@ -122,10 +123,13 @@ class ZeroPlugin(BeetsPlugin):
         config.
         """
         fields_set = False
+        if self.config["omit_single_disc"].get(bool) and item.disctotal == 1:
+            for tag in {"disc", "disctotal"} & set(tags):
+                tags[tag] = None
+                fields_set = True
 
         if not self.fields_to_progs:
-            self._log.warning("no fields, nothing to do")
-            return False
+            self._log.warning("no fields list to remove")
 
         for field, progs in self.fields_to_progs.items():
             if field in tags:

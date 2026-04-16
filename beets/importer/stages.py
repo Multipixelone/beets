@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import itertools
 import logging
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
 from beets import config, plugins
 from beets.util import MoveOperation, displayable_path, pipeline
@@ -30,6 +30,8 @@ from .tasks import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from beets import library
 
     from .session import ImportSession
@@ -228,6 +230,7 @@ def import_asis(session: ImportSession, task: ImportTask):
 
     log.info("{}", displayable_path(task.paths))
     task.set_choice(Action.ASIS)
+    _resolve_duplicates(session, task)
     _apply_choice(session, task)
 
 
@@ -386,5 +389,5 @@ def _extend_pipeline(tasks, *stages):
     else:
         task_iter = tasks
 
-    ipl = pipeline.Pipeline([task_iter] + list(stages))
+    ipl = pipeline.Pipeline([task_iter, *list(stages)])
     return pipeline.multiple(ipl.pull())

@@ -143,13 +143,13 @@ Optional command flags:
   :ref:`set_fields` configuration dictionary. You can use the option multiple
   times on the command line, like so:
 
-  ::
+.. code-block:: sh
 
-      beet import --set genre="Alternative Rock" --set mood="emotional"
+    beet import --set genres="Alternative Rock" --set mood="emotional"
 
 .. _py7zr: https://pypi.org/project/py7zr/
 
-.. _rarfile: https://pypi.python.org/pypi/rarfile/
+.. _rarfile: https://pypi.org/project/rarfile/
 
 .. only:: html
 
@@ -266,6 +266,15 @@ Values can also be *templates*, using the same syntax as :doc:`path formats
 <pathformat>`. For example, ``beet modify artist='$artist_sort'`` will copy the
 artist sort name into the artist field for all your tracks, and ``beet modify
 title='$track $title'`` will add track numbers to their title metadata.
+
+To adjust a multi-valued field, such as ``genres``, ``remixers``, ``lyricists``,
+``composers``, or ``arrangers``, separate the values with |semicolon_space|. For
+example, ``beet modify genres="rock; pop"``.
+
+For compatibility, ``modify`` assignments and query expressions still accept
+legacy singular names such as ``genre``, ``composer``, ``lyricist``,
+``remixer``, and ``arranger``, but beets will warn and translate them to the
+plural multi-valued fields. Prefer the plural field names in new commands.
 
 The ``-a`` option changes to querying album fields instead of track fields and
 also enables to operate on albums in addition to the individual tracks. Without

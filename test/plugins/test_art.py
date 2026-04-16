@@ -28,7 +28,8 @@ import pytest
 import responses
 
 from beets import config, importer, logging, util
-from beets.autotag import AlbumInfo, AlbumMatch
+from beets.autotag.distance import Distance
+from beets.autotag.hooks import AlbumInfo, AlbumMatch
 from beets.test import _common
 from beets.test.helper import (
     BeetsTestCase,
@@ -261,7 +262,9 @@ class FSArtTest(UseThePlugin):
         os.mkdir(syspath(self.dpath))
 
         self.source = fetchart.FileSystem(logger, self.plugin.config)
-        self.settings = Settings(cautious=False, cover_names=("art",))
+        self.settings = Settings(
+            cautious=False, cover_names=("art",), fallback=None
+        )
 
     def test_finds_jpg_in_directory(self):
         _common.touch(os.path.join(self.dpath, b"a.jpg"))
@@ -285,6 +288,13 @@ class FSArtTest(UseThePlugin):
         with pytest.raises(StopIteration):
             next(self.source.get(None, self.settings, [self.dpath]))
 
+    def test_configured_fallback_is_used(self):
+        fallback = os.path.join(self.temp_dir, b"a.jpg")
+        _common.touch(fallback)
+        self.settings.fallback = fallback
+        candidate = next(self.source.get(None, self.settings, [self.dpath]))
+        assert candidate.path == fallback
+
     def test_empty_dir(self):
         with pytest.raises(StopIteration):
             next(self.source.get(None, self.settings, [self.dpath]))
@@ -300,6 +310,16 @@ class FSArtTest(UseThePlugin):
             for candidate in self.source.get(None, self.settings, [self.dpath])
         ]
         assert candidates == paths
+
+    @patch("os.path.samefile")
+    def test_is_candidate_fallback_os_error(self, mock_samefile):
+        mock_samefile.side_effect = OSError("os error")
+        fallback = os.path.join(self.temp_dir, b"a.jpg")
+        self.plugin.fallback = fallback
+        candidate = fetchart.Candidate(logger, self.source.ID, fallback)
+        result = self.plugin._is_candidate_fallback(candidate)
+        mock_samefile.assert_called_once()
+        assert not result
 
 
 class CombinedTest(FetchImageTestCase, CAAHelper):
@@ -787,7 +807,7 @@ class ArtImporterTest(UseThePlugin):
             artist_id="artistid",
             tracks=[],
         )
-        self.task.set_choice(AlbumMatch(0, info, {}, set(), set()))
+        self.task.set_choice(AlbumMatch(Distance(), info, {}))
 
     def tearDown(self):
         super().tearDown()

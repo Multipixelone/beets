@@ -25,9 +25,17 @@ Fetch Lyrics During Import
 --------------------------
 
 When importing new files, beets will now fetch lyrics for files that don't
-already have them. The lyrics will be stored in the beets database. If the
-``import.write`` config option is on, then the lyrics will also be written to
-the files' tags.
+already have them. The lyrics will be stored in the beets database. The plugin
+also sets a few useful flexible attributes:
+
+- ``lyrics_backend``: name of the backend that provided the lyrics
+- ``lyrics_url``: URL of the page where the lyrics were found
+- ``lyrics_language``: original language of the lyrics
+- ``lyrics_translation_language``: language of the lyrics translation (if
+  translation is enabled)
+
+If the ``import.write`` config option is on, then the lyrics will also be
+written to the files' tags.
 
 Configuration
 -------------
@@ -39,6 +47,7 @@ Default configuration:
 
     lyrics:
         auto: yes
+        auto_ignore: null
         translate:
             api_key:
             from_languages: []
@@ -49,12 +58,27 @@ Default configuration:
         google_API_key: null
         google_engine_ID: 009217259823014548361:lndtuqkycfu
         print: no
-        sources: [lrclib, google, genius, tekstowo]
+        sources: [lrclib, google, genius]
         synced: no
 
 The available options are:
 
 - **auto**: Fetch lyrics automatically during import.
+- **auto_ignore**: A beets query string of items to skip when fetching lyrics
+  during auto import. For example, to skip tracks from Bandcamp or with a Techno
+  genre:
+
+  .. code-block:: yaml
+
+      lyrics:
+        auto_ignore: |
+          data_source:bandcamp
+          ,
+          genres:techno
+
+  Default: ``null`` (nothing is ignored). See :doc:`/reference/query` for the
+  query syntax.
+
 - **translate**:
 
   - **api_key**: Api key to access your Azure Translator resource. (see
@@ -80,11 +104,14 @@ The available options are:
 - **print**: Print lyrics to the console.
 - **sources**: List of sources to search for lyrics. An asterisk ``*`` expands
   to all available sources. The ``google`` source will be automatically
-  deactivated if no ``google_API_key`` is setup.
+  deactivated if no ``google_API_key`` is setup. By default, ``musixmatch`` and
+  ``tekstowo`` are excluded because they block the beets User-Agent.
 - **synced**: Prefer synced lyrics over plain lyrics if a source offers them.
-  Currently ``lrclib`` is the only source that provides them.
+  Currently ``lrclib`` is the only source that provides them. Using this option,
+  existing synced lyrics are not replaced by newly fetched plain lyrics (even
+  when ``force`` is enabled). To allow that replacement, disable ``synced``.
 
-.. _beets custom search engine: https://www.google.com:443/cse/publicurl?cx=009217259823014548361:lndtuqkycfu
+.. _beets custom search engine: https://cse.google.com/cse?cx=009217259823014548361:lndtuqkycfu
 
 Fetching Lyrics Manually
 ------------------------
@@ -137,11 +164,11 @@ Sphinx supports various builders_, see a few suggestions:
 
         sphinx-build -b latex <dir> <dir>/latex && make -C <dir>/latex all-pdf
 
-.. _builders: https://www.sphinx-doc.org/en/stable/builders.html
+.. _builders: https://www.sphinx-doc.org/en/master/usage/builders/index.html
 
-.. _restructuredtext: http://docutils.sourceforge.net/rst.html
+.. _restructuredtext: https://sourceforge.net/projects/docutils/
 
-.. _sphinx: https://www.sphinx-doc.org/
+.. _sphinx: https://www.sphinx-doc.org/en/master/
 
 Activate Google Custom Search
 -----------------------------
@@ -162,7 +189,7 @@ beets use a list of sources known to be scrapeable.
 Note that the Google custom search API is limited to 100 queries per day. After
 that, the lyrics plugin will fall back on other declared data sources.
 
-.. _define a custom search engine: https://www.google.com/cse/all
+.. _define a custom search engine: https://programmablesearchengine.google.com/about/
 
 .. _lyrics-translation:
 
@@ -173,6 +200,9 @@ We use Azure to optionally translate your lyrics. To set up the integration,
 follow these steps:
 
 1. `Create a Translator resource`_ on Azure.
+       Make sure the region of the translator resource is set to Global. You
+       will get 401 unauthorized errors if not. The region of the resource group
+       does not matter.
 2. `Obtain its API key`_.
 3. Add the API key to your configuration as ``translate.api_key``.
 4. Configure your target language using the ``translate.to_language`` option.

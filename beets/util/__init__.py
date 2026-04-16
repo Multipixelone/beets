@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import errno
 import fnmatch
 import os
@@ -27,7 +28,6 @@ import subprocess
 import sys
 import tempfile
 import traceback
-import warnings
 from collections import Counter
 from collections.abc import Sequence
 from contextlib import suppress
@@ -41,12 +41,11 @@ from typing import (
     TYPE_CHECKING,
     Any,
     AnyStr,
-    Callable,
     ClassVar,
     Generic,
     NamedTuple,
     TypeVar,
-    Union,
+    cast,
 )
 
 from unidecode import unidecode
@@ -55,17 +54,16 @@ import beets
 from beets.util import hidden
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
     from logging import Logger
 
     from beets.library import Item
 
-
 MAX_FILENAME_LENGTH = 200
 WINDOWS_MAGIC_PREFIX = "\\\\?\\"
 T = TypeVar("T")
-PathLike = Union[str, bytes, Path]
-StrPath = Union[str, Path]
+StrPath = str | Path
+PathLike = StrPath | bytes
 Replacements = Sequence[tuple[Pattern[str], str]]
 
 # Here for now to allow for a easy replace later on
@@ -166,6 +164,12 @@ class MoveOperation(Enum):
     HARDLINK = 3
     REFLINK = 4
     REFLINK_AUTO = 5
+
+
+class PromptChoice(NamedTuple):
+    short: str
+    long: str
+    callback: Any
 
 
 def normpath(path: PathLike) -> bytes:
@@ -577,10 +581,14 @@ def hardlink(path: bytes, dest: bytes, replace: bool = False):
     if samefile(path, dest):
         return
 
-    if os.path.exists(syspath(dest)) and not replace:
+    # Dereference symlinks, expand "~", and convert relative paths to absolute
+    origin_path = Path(os.fsdecode(path)).expanduser().resolve()
+    dest_path = Path(os.fsdecode(dest)).expanduser().resolve()
+
+    if dest_path.exists() and not replace:
         raise FilesystemError("file exists", "rename", (path, dest))
     try:
-        os.link(syspath(path), syspath(dest))
+        dest_path.hardlink_to(origin_path)
     except NotImplementedError:
         raise FilesystemError(
             "OS does not support hard links.link",
@@ -836,9 +844,10 @@ def get_most_common_tags(
         "country",
         "media",
         "albumdisambig",
+        "data_source",
     ]
     for field in fields:
-        values = [item[field] for item in items if item]
+        values = [item.get(field) for item in items if item]
         likelies[field], freq = plurality(values)
         consensus[field] = freq == len(values)
 
@@ -925,7 +934,8 @@ def open_anything() -> str:
     if sys_name == "Darwin":
         base_cmd = "open"
     elif sys_name == "Windows":
-        base_cmd = "start"
+        # `start` is a cmd.exe builtin, so invoke it through the shell.
+        base_cmd = 'cmd /c start ""'
     else:  # Assume Unix
         base_cmd = "xdg-open"
     return base_cmd
@@ -1038,20 +1048,24 @@ def asciify_path(path: str, sep_replace: str) -> str:
 
 
 def par_map(transform: Callable[[T], Any], items: Sequence[T]) -> None:
-    """Apply the function `transform` to all the elements in the
-    iterable `items`, like `map(transform, items)` but with no return
-    value.
+    """Apply a transformation to each item concurrently using a thread pool.
 
-    The parallelism uses threads (not processes), so this is only useful
-    for IO-bound `transform`s.
+    Propagates the calling thread's context variables into each worker,
+    ensuring that context-dependent state is available during parallel
+    execution.
     """
-    pool = ThreadPool()
-    pool.map(transform, items)
-    pool.close()
-    pool.join()
+    ctx = contextvars.copy_context()  # snapshot parent context at call time
+
+    def _worker(item: T) -> Any:
+        # ThreadPool workers may run concurrently, so each task needs its own
+        # child context rather than sharing one Context instance.
+        return ctx.copy().run(transform, item)
+
+    with ThreadPool() as pool:
+        pool.map(_worker, items)
 
 
-class cached_classproperty:
+class cached_classproperty(Generic[T]):
     """Descriptor implementing cached class properties.
 
     Provides class-level dynamic property behavior where the getter function is
@@ -1059,9 +1073,9 @@ class cached_classproperty:
     instance properties, this operates on the class rather than instances.
     """
 
-    cache: ClassVar[dict[tuple[Any, str], Any]] = {}
+    cache: ClassVar[dict[tuple[type[object], str], object]] = {}
 
-    name: str
+    name: str = ""
 
     # Ideally, we would like to use `Callable[[type[T]], Any]` here,
     # however, `mypy` is unable to see this as a **class** property, and thinks
@@ -1077,21 +1091,21 @@ class cached_classproperty:
     #   "Callable[[Album], ...]"; expected "Callable[[type[Album]], ...]"
     #
     # Therefore, we just use `Any` here, which is not ideal, but works.
-    def __init__(self, getter: Callable[[Any], Any]) -> None:
+    def __init__(self, getter: Callable[..., T]) -> None:
         """Initialize the descriptor with the property getter function."""
-        self.getter = getter
+        self.getter: Callable[..., T] = getter
 
-    def __set_name__(self, owner: Any, name: str) -> None:
+    def __set_name__(self, owner: object, name: str) -> None:
         """Capture the attribute name this descriptor is assigned to."""
         self.name = name
 
-    def __get__(self, instance: Any, owner: type[Any]) -> Any:
+    def __get__(self, instance: object, owner: type[object]) -> T:
         """Compute and cache if needed, and return the property value."""
-        key = owner, self.name
+        key: tuple[type[object], str] = owner, self.name
         if key not in self.cache:
             self.cache[key] = self.getter(owner)
 
-        return self.cache[key]
+        return cast(T, self.cache[key])
 
 
 class LazySharedInstance(Generic[T]):
@@ -1190,26 +1204,3 @@ def get_temp_filename(
 def unique_list(elements: Iterable[T]) -> list[T]:
     """Return a list with unique elements in the original order."""
     return list(dict.fromkeys(elements))
-
-
-def deprecate_imports(
-    old_module: str, new_module_by_name: dict[str, str], name: str, version: str
-) -> Any:
-    """Handle deprecated module imports by redirecting to new locations.
-
-    Facilitates gradual migration of module structure by intercepting import
-    attempts for relocated functionality. Issues deprecation warnings while
-    transparently providing access to the moved implementation, allowing
-    existing code to continue working during transition periods.
-    """
-    if new_module := new_module_by_name.get(name):
-        warnings.warn(
-            (
-                f"'{old_module}.{name}' is deprecated and will be removed"
-                f" in {version}. Use '{new_module}.{name}' instead."
-            ),
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return getattr(import_module(new_module), name)
-    raise AttributeError(f"module '{old_module}' has no attribute '{name}'")

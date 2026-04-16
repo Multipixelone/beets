@@ -77,10 +77,10 @@ pluginpath
 ~~~~~~~~~~
 
 Directories to search for plugins. Each Python file or directory in a plugin
-path represents a plugin and should define a subclass of :class:`BeetsPlugin`. A
-plugin can then be loaded by adding the filename to the ``plugins``
-configuration. The plugin path can either be a single string or a list of
-strings---so, if you have multiple paths, format them as a YAML list like so:
+path represents a plugin and should define a subclass of |BeetsPlugin|. A plugin
+can then be loaded by adding the plugin name to the ``plugins`` configuration.
+The plugin path can either be a single string or a list of strings---so, if you
+have multiple paths, format them as a YAML list like so:
 
 ::
 
@@ -376,7 +376,7 @@ terminal_encoding
 ~~~~~~~~~~~~~~~~~
 
 The text encoding, as `known to Python
-<https://docs.python.org/2/library/codecs.html#standard-encodings>`__, to use
+<https://docs.python.org/3/library/codecs.html#standard-encodings>`__, to use
 for messages printed to the standard output. It's also used to read messages
 from the standard input. By default, this is determined automatically from the
 locale environment variables.
@@ -467,14 +467,20 @@ Available attributes:
 
 Foreground colors
     ``black``, ``red``, ``green``, ``yellow``, ``blue``, ``magenta``, ``cyan``,
-    ``white``
+    ``white``, ``bright_black``, ``bright_red``, ``bright_green``,
+    ``bright_yellow``, ``bright_blue``, ``bright_magenta``, ``bright_cyan``,
+    ``bright_white``
 
 Background colors
     ``bg_black``, ``bg_red``, ``bg_green``, ``bg_yellow``, ``bg_blue``,
-    ``bg_magenta``, ``bg_cyan``, ``bg_white``
+    ``bg_magenta``, ``bg_cyan``, ``bg_white``, ``bg_bright_black``,
+    ``bg_bright_red``, ``bg_bright_green``, ``bg_bright_yellow``,
+    ``bg_bright_blue``, ``bg_bright_magenta``, ``bg_bright_cyan``,
+    ``bg_bright_white``
 
 Text styles
-    ``normal``, ``bold``, ``faint``, ``underline``, ``reverse``
+    ``normal``, ``bold``, ``faint``, ``italic``, ``underline``, ``blink_slow``,
+    ``blink_rapid``, ``inverse``, ``conceal``, ``crossed_out``
 
 terminal_width
 ~~~~~~~~~~~~~~
@@ -732,6 +738,9 @@ MusicBrainz. You can use a space-separated list of language abbreviations, like
 ``en jp es``, to specify a preference order. Defaults to an empty list, meaning
 that no language is preferred.
 
+The alias is used for artist name, track title, release group title and album
+title.
+
 .. _ignored_alias_types:
 
 ignored_alias_types
@@ -847,11 +856,11 @@ set_fields
 A dictionary indicating fields to set to values for newly imported music. Here's
 an example:
 
-::
+.. code-block:: yaml
 
     set_fields:
-        genre: 'To Listen'
-        collection: 'Unordered'
+        genres: To Listen
+        collection: Unordered
 
 Other field/value pairs supplied via the ``--set`` option on the command-line
 override any settings here for fields with the same name.
@@ -874,6 +883,36 @@ appended to the disambiguation string of matching track candidates. For example:
 ``The Artist - The Title (Discogs, Index 3, Track B1, [The Album]``. This
 feature is currently supported by the :doc:`/plugins/discogs` and the
 :doc:`/plugins/spotify`.
+
+Default: ``yes``.
+
+.. _fix_ext_inplace:
+
+fix_ext_inplace
+~~~~~~~~~~~~~~~
+
+The extension of each file is checked at import. If a file has no extension and
+its binary matches a music format, beets will look for a file with the same name
+and matching extension in the same directory. For example, when importing an mp3
+file named ``asdf``, beets look for ``asdf.mp3``. If found, that file will be
+imported instead. Otherwise, if ``fix_ext_inplace`` is ``yes``, then the file
+will be renamed to contain the extension. If ``fix_ext_inplace`` is ``no``, then
+the original will be left untouched and a copy with extension will be created in
+the same directory. This is only done if the user has ``ffprobe`` (bundled with
+FFmpeg)
+
+Default: ``no``.
+
+.. _remux_mp3_in_wav:
+
+remux_mp3_in_wav
+~~~~~~~~~~~~~~~~
+
+Some WAV files contain MP3 audio streams (``WAVE_FORMAT_MPEGLAYER3``) rather
+than the standard PCM format. When this option is enabled, beets will
+automatically extract the MP3 stream into a proper ``.mp3`` file during import,
+removing the WAV container. The original WAV file is deleted after successful
+extraction.
 
 Default: ``yes``.
 
@@ -907,6 +946,55 @@ and the next-best match is above the *gap* threshold, the importer will suggest
 that match but not automatically confirm it. Otherwise, you'll see a list of
 options to choose from.
 
+.. _distance-weights:
+
+distance_weights
+~~~~~~~~~~~~~~~~
+
+The ``distance_weights`` option allows you to customize how much each field
+contributes to the overall distance score when matching albums and tracks.
+Higher weights mean that differences in that field are penalized more heavily,
+making them more important in the matching decision.
+
+The defaults are:
+
+.. code-block:: yaml
+
+    match:
+        distance_weights:
+            data_source: 2.0
+            artist: 3.0
+            album: 3.0
+            media: 1.0
+            mediums: 1.0
+            year: 1.0
+            country: 0.5
+            label: 0.5
+            catalognum: 0.5
+            albumdisambig: 0.5
+            album_id: 5.0
+            tracks: 2.0
+            missing_tracks: 0.9
+            unmatched_tracks: 0.6
+            track_title: 3.0
+            track_artist: 2.0
+            track_index: 1.0
+            track_length: 2.0
+            track_id: 5.0
+            medium: 1.0
+
+For example, if you don't care as much about matching the exact release year,
+you can reduce its weight:
+
+.. code-block:: yaml
+
+    match:
+        distance_weights:
+            year: 0.1
+
+You only need to specify the fields you want to override; unspecified fields
+keep their default weights.
+
 .. _max_rec:
 
 max_rec
@@ -935,7 +1023,7 @@ can be one of ``none``, ``low``, ``medium`` or ``strong``. When the maximum
 recommendation is ``strong``, no "downgrading" occurs. The available penalty
 names here are:
 
-- source
+- data_source
 - artist
 - album
 - media
@@ -1166,9 +1254,9 @@ Here's an example file:
         color: yes
 
     paths:
-        default: $genre/$albumartist/$album/$track $title
+        default: %first{$genres}/$albumartist/$album/$track $title
         singleton: Singletons/$artist - $title
-        comp: $genre/$album/$track $title
+        comp: %first{$genres}/$album/$track $title
         albumtype:soundtrack: Soundtracks/$album/$track $title
 
 .. only:: man

@@ -178,6 +178,12 @@ registration process in this case:
     :Parameters: ``info`` (|AlbumInfo|)
     :Description: Like ``trackinfo_received`` but for album-level metadata.
 
+``album_matched``
+    :Parameters: ``match`` (``AlbumMatch``)
+    :Description: Called each time an ``AlbumMatch`` candidate is created while
+        importing. This applies to both ID-driven and text-search matching.
+        Missing and extra tracks, if any, are included in the match.
+
 ``before_choose_candidate``
     :Parameters: ``task`` (|ImportTask|), ``session`` (|ImportSession|)
     :Description: Called before prompting the user during interactive import.
